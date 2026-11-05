@@ -300,11 +300,18 @@ final class SourcePipeline {
         return base.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    /// 把列表项塞进上下文，让 `{{$.name}}` 这类模板能取到当前项。
+    /// 把列表项塞进上下文。
+    ///
+    /// 注意：**不把条目的字段注入成全局变量**。之前那样做踩过坑 ——
+    /// 书源字段名（`anchor`、`name`、`top`…）会和 JS 宿主对象重名
+    /// （`anchor` 是 window.anchor），结果 `String(result.anchor)` 拿到的是
+    /// `function anchor() { [native code] }`。
+    /// 正确语义是让脚本从 `result` 里取当前条目，这里只做上下文继承。
     private func ctxWithItem(_ item: [String: Any], base: RuleContext) -> RuleContext {
         var ctx = base
-        for (k, v) in item {
-            if let s = v as? String { ctx.vars[k] = s }
+        // 只透传少数几个确定安全的标量，供模板 `{{字段}}` 使用
+        for key in ["book_id", "bookId", "id"] {
+            if let v = item[key] { ctx.vars[key] = "\(v)" }
         }
         return ctx
     }

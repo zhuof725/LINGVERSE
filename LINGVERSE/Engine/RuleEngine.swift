@@ -54,9 +54,23 @@ enum RuleEngine {
     // MARK: - 入口
 
     /// 解析单条规则。`ctx.body` 为当前响应，`json` 传 nil 时按需把 body 解析成 JSON 对象。
+    ///
+    /// `result` 的语义照 Legado：脚本里能直接用的「当前值」。
+    /// 逐条解析（bookList 之后取 name/author）时它是当前条目的 JSON，
+    /// 否则是整段响应正文。
     static func eval(_ rule: String?, _ ctx: RuleContext, json: Any? = nil) -> RuleValue {
         guard let raw = rule?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
             return .text("")
+        }
+
+        // 当前值：有 json（说明在处理列表里的某一项）就序列化它，否则给响应正文
+        let currentResult: String
+        if let json, !(json is String) {
+            currentResult = serializeJSON(json)
+        } else if let json = json as? String {
+            currentResult = json
+        } else {
+            currentResult = ctx.body
         }
 
         // 0) 两段式：`<js>...</js>$[*]` 或 `@js:...</js>$[*]`
@@ -65,7 +79,8 @@ enum RuleEngine {
         //    只认前缀会把 `$[*]` 当成脚本的一部分，直接语法报错。
         if let twoPhase = splitScriptAndPath(raw) {
             let ctxJSON = json ?? parseJSON(ctx.body)
-            let produced = JSRunner.shared.run(twoPhase.script, ctx: ctx, json: ctxJSON)
+            let produced = JSRunner.shared.run(twoPhase.script, ctx: ctx, json: ctxJSON,
+                                               result: ctx.body)
             if twoPhase.path.isEmpty { return .text(produced) }
             let parsed = parseJSON(produced) ?? produced
             let nodes = jsonPathNodes(twoPhase.path, parsed)
@@ -77,7 +92,7 @@ enum RuleEngine {
         // 1) 纯脚本规则（@js: / <js>）——整条规则交给 JS 引擎
         if let script = RuleScanner.scriptBody(raw) {
             let ctxJSON = json ?? RuleEngine.parseJSON(ctx.body)
-            let out = JSRunner.shared.run(script, ctx: ctx, json: ctxJSON)
+            let out = JSRunner.shared.run(script, ctx: ctx, json: ctxJSON, result: currentResult)
             return .text(out)
         }
 
@@ -140,23 +155,27 @@ enum RuleEngine {
     static func evalList(_ rule: String?, _ ctx: RuleContext, json: Any? = nil) -> [[String: Any]] {
         guard let rule, !rule.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return [] }
         let ctxJSON = json ?? parseJSON(ctx.body)
+        // 列表脚本里的 `result` 指的是「本轮响应正文」。
+        // 真实书源第一行就是 `JSON.parse(result)`，不传的话它 catch 成 {} 返回空数组，
+        // 于是一条都不报错却一条都搜不到 —— 这个坑很难从界面上看出来。
+        let response = ctx.body
 
         // 两段式 `<js>...</js>$[*]`：脚本产出 JSON，路径取数组
         if let twoPhase = splitScriptAndPath(rule) {
-            let produced = JSRunner.shared.run(twoPhase.script, ctx: ctx, json: ctxJSON)
+            let produced = JSRunner.shared.run(twoPhase.script, ctx: ctx, json: ctxJSON, result: response)
             let parsed = parseJSON(produced)
             if let path = twoPhase.path.isEmpty ? nil : twoPhase.path, let parsed {
                 let nodes = jsonPathNodes(path, parsed)
                 let dicts = nodes.compactMap { $0 as? [String: Any] }
                 if !dicts.isEmpty { return dicts }
             }
-            // 路径为空或没解出数组：直接当 JSON 数组
+            // 路径解析不出来时退回按 JSON 数组解析
             return JSRunner.parseList(produced)
         }
 
         // 纯 JS 规则可能直接返回数组
         if RuleScanner.scriptBody(rule) != nil {
-            let out = JSRunner.shared.run(rule, ctx: ctx, json: ctxJSON)
+            let out = JSRunner.shared.run(rule, ctx: ctx, json: ctxJSON, result: response)
             return JSRunner.parseList(out)
         }
         // JSON 数组路径
@@ -185,6 +204,16 @@ enum RuleEngine {
         guard let first = t.first, first == "{" || first == "[" else { return nil }
         guard let data = t.data(using: .utf8) else { return nil }
         return try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
+    }
+
+    /// 把任意 JSON 对象序列化回字符串，给脚本当 `result` 用。
+    static func serializeJSON(_ value: Any) -> String {
+        if let s = value as? String { return s }
+        if let n = value as? NSNumber { return n.stringValue }
+        guard JSONSerialization.isValidJSONObject(value),
+              let data = try? JSONSerialization.data(withJSONObject: value),
+              let s = String(data: data, encoding: .utf8) else { return "" }
+        return s
     }
 
     // MARK: - 模板

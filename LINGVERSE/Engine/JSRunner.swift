@@ -104,6 +104,11 @@ final class JSRunner {
         let log: @convention(block) (String) -> Void = { s in
             Diagnostics.shared.add("js", s)
         }
+        // 给 result 双面值用的内部解码器
+        let decodeB64: @convention(block) (String) -> String = { s in
+            guard let d = Data(base64Encoded: s, options: .ignoreUnknownCharacters) else { return "" }
+            return String(data: d, encoding: .utf8) ?? ""
+        }
 
         context.setObject(ajax, forKeyedSubscript: "__ajax" as NSString)
         context.setObject(ajaxTimeout, forKeyedSubscript: "__ajaxTimeout" as NSString)
@@ -114,6 +119,7 @@ final class JSRunner {
         context.setObject(md5, forKeyedSubscript: "__md5" as NSString)
         context.setObject(sha256, forKeyedSubscript: "__sha256" as NSString)
         context.setObject(log, forKeyedSubscript: "__log" as NSString)
+        context.setObject(decodeB64, forKeyedSubscript: "__decodeB64" as NSString)
 
         // 规则变量：把原生侧的表序列化进去，求值结束后再回收。
         // 这样 java.put 在 bookInfo 里写的 book_id，toc 规则里才 get 得到。
@@ -144,7 +150,15 @@ final class JSRunner {
         }
         context.evaluateScript("var book = \(Self.jsLiteral(ctx.book));"
                              + "var chapter = \(Self.jsLiteral(ctx.chapter));")
-        if let result { context.setObject(result, forKeyedSubscript: "result" as NSString) }
+        // `result` 必须是"双面"的：既能 JSON.parse(result) 当字符串，
+        // 也能 result.author 当对象。真实书源两种写法都用：
+        //   bookList: JSON.parse(result)      ← 要字符串
+        //   author:   String(result.author)   ← 要对象
+        // 只满足一种，另一种就静默失败（脚本 catch 成 {} 返回空数组），
+        // 界面上表现为「搜不到」，完全看不出原因。
+        if let result {
+            injectResult(result, into: context)
+        }
 
         // 让脚本能拿到当前响应（部分源写成 `result` 之外的名字）
         context.setObject(ctx.body, forKeyedSubscript: "__body" as NSString)
@@ -170,8 +184,40 @@ final class JSRunner {
         return context
     }
 
-    private func evaluate(_ script: String, in context: JSContext) -> JSValue? {
-        let value = context.evaluateScript(script, withSourceURL: URL(string: "lingverse://rule.js"))
+    /// 把 `result` 注入成「双面值」。
+    ///
+    /// JavaScriptCore 里没法给已有对象挂 Swift 闭包当 toString，所以换个思路：
+    /// 用 JS 侧构造一个包装对象，`toString/valueOf` 返回原始 JSON 文本，
+    /// 属性访问透传到解析后的对象。这样 `JSON.parse(result)` 和 `result.author` 都成立。
+    private func injectResult(_ raw: String, into context: JSContext) {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let isJSON = trimmed.hasPrefix("{") || trimmed.hasPrefix("[")
+        guard isJSON else {
+            context.setObject(raw, forKeyedSubscript: "result" as NSString)
+            return
+        }
+        // 用 base64 传文本，避免 JSON 里的引号/换行破坏 JS 字面量
+        let encoded = Data(raw.utf8).base64EncodedString()
+        let js = """
+        (function() {
+          var text = __decodeB64('\(encoded)');
+          var obj;
+          try { obj = JSON.parse(text); } catch (e) { obj = {}; }
+          if (obj === null || typeof obj !== 'object') { return { value: text }; }
+          // 字符串语义：JSON.parse(result) / String(result) 都拿原文
+          Object.defineProperty(obj, 'toString', { value: function() { return text; }, enumerable: false });
+          Object.defineProperty(obj, 'valueOf',  { value: function() { return text; }, enumerable: false });
+          return { value: obj };
+        })()
+        """
+        if let value = context.evaluateScript(js), let obj = value.objectForKeyedSubscript("value") {
+            context.setObject(obj, forKeyedSubscript: "result" as NSString)
+        } else {
+            context.setObject(raw, forKeyedSubscript: "result" as NSString)
+        }
+    }
+
+    private func evaluate(_ script: String, in context: JSContext) -> JSValue? {        let value = context.evaluateScript(script, withSourceURL: URL(string: "lingverse://rule.js"))
         if let exception = context.exception {
             lastError = exception.toString() ?? "unknown"
             Diagnostics.shared.add("js", "rule failed: \(lastError ?? "")")
