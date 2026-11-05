@@ -55,16 +55,33 @@ enum RuleEngine {
 
     /// 解析单条规则。`ctx.body` 为当前响应，`json` 传 nil 时按需把 body 解析成 JSON 对象。
     static func eval(_ rule: String?, _ ctx: RuleContext, json: Any? = nil) -> RuleValue {
-        guard var text = rule?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else {
+        guard let raw = rule?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
             return .text("")
         }
 
+        // 0) 两段式：`<js>...</js>$[*]` 或 `@js:...</js>$[*]`
+        //    JS 先产出一段 JSON，再按后面的 JSONPath 取值。
+        //    真实书源（番茄畅听）的 bookList / chapterList 全是这个形态，
+        //    只认前缀会把 `$[*]` 当成脚本的一部分，直接语法报错。
+        if let twoPhase = splitScriptAndPath(raw) {
+            let ctxJSON = json ?? parseJSON(ctx.body)
+            let produced = JSRunner.shared.run(twoPhase.script, ctx: ctx, json: ctxJSON)
+            if twoPhase.path.isEmpty { return .text(produced) }
+            let parsed = parseJSON(produced) ?? produced
+            let nodes = jsonPathNodes(twoPhase.path, parsed)
+            if nodes.isEmpty { return .text("") }
+            if nodes.count == 1, let s = nodes[0] as? String { return .text(s) }
+            return .text(nodes.map { scalarString($0) }.joined(separator: "\n"))
+        }
+
         // 1) 纯脚本规则（@js: / <js>）——整条规则交给 JS 引擎
-        if let script = RuleScanner.scriptBody(text) {
+        if let script = RuleScanner.scriptBody(raw) {
             let ctxJSON = json ?? RuleEngine.parseJSON(ctx.body)
             let out = JSRunner.shared.run(script, ctx: ctx, json: ctxJSON)
             return .text(out)
         }
+
+        var text = raw
 
         // 2) `selector@js:...` —— 先求选择器，再把结果作为 result 交给脚本
         if let range = valueScriptSplit(text) {
@@ -79,8 +96,43 @@ enum RuleEngine {
         // 3) 模板：把 {{expr}} 先替换成求值结果，剩余规则当普通选择器
         text = expandTemplate(text, ctx: ctx, json: json)
 
-        // 4) 管道：`@@` 只取首项 / `##` 正则替换 / `&&` 交集
+        // 4) 管道：`##` 正则替换 / `&&` 交集
         return evalPipeline(text, ctx: ctx, json: json)
+    }
+
+    /// 拆出 `<js>脚本</js>` 后面跟的 JSONPath。
+    /// 返回 nil 表示不是这种两段式规则。
+    static func splitScriptAndPath(_ rule: String) -> (script: String, path: String)? {
+        let text = rule.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // 形式一：<js> ... </js> <path>
+        if text.hasPrefix("<js>"), let end = text.range(of: "</js>", options: .backwards) {
+            let script = String(text[text.index(text.startIndex, offsetBy: 4)..<end.lowerBound])
+            let path = String(text[end.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            return (script, path)
+        }
+
+        // 形式二：@js: ... </js> <path>
+        if text.hasPrefix("@js:"), let end = text.range(of: "</js>", options: .backwards) {
+            let script = String(text[text.index(text.startIndex, offsetBy: 4)..<end.lowerBound])
+            let path = String(text[end.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            return (script, path)
+        }
+
+        // 形式三：@js: ... 后面跟一行以 $ 开头的路径（没有 </js> 闭合）
+        if text.hasPrefix("@js:") {
+            let body = String(text.dropFirst(4))
+            let lines = body.split(whereSeparator: { $0 == "\n" }, omittingEmptySubsequences: false)
+            if let last = lines.last {
+                let tail = String(last).trimmingCharacters(in: .whitespaces)
+                if tail.hasPrefix("$") && tail.count < 40 && !tail.contains(" "),
+                   lines.count > 1 {
+                    let script = lines.dropLast().joined(separator: "\n")
+                    return (script, tail)
+                }
+            }
+        }
+        return nil
     }
 
     /// 求一个列表规则（bookList / chapterList），返回字典数组。
@@ -88,10 +140,24 @@ enum RuleEngine {
     static func evalList(_ rule: String?, _ ctx: RuleContext, json: Any? = nil) -> [[String: Any]] {
         guard let rule, !rule.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return [] }
         let ctxJSON = json ?? parseJSON(ctx.body)
+
+        // 两段式 `<js>...</js>$[*]`：脚本产出 JSON，路径取数组
+        if let twoPhase = splitScriptAndPath(rule) {
+            let produced = JSRunner.shared.run(twoPhase.script, ctx: ctx, json: ctxJSON)
+            let parsed = parseJSON(produced)
+            if let path = twoPhase.path.isEmpty ? nil : twoPhase.path, let parsed {
+                let nodes = jsonPathNodes(path, parsed)
+                let dicts = nodes.compactMap { $0 as? [String: Any] }
+                if !dicts.isEmpty { return dicts }
+            }
+            // 路径为空或没解出数组：直接当 JSON 数组
+            return JSRunner.parseList(produced)
+        }
+
         // 纯 JS 规则可能直接返回数组
         if RuleScanner.scriptBody(rule) != nil {
-            let out = JSRunner.shared.runList(rule, ctx: ctx, json: ctxJSON)
-            return out
+            let out = JSRunner.shared.run(rule, ctx: ctx, json: ctxJSON)
+            return JSRunner.parseList(out)
         }
         // JSON 数组路径
         if let obj = ctxJSON {
