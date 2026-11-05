@@ -1,0 +1,80 @@
+name: Build IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          sw_vers
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate project
+        run: xcodegen generate
+
+      - name: Build unsigned app
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project LINGVERSE.xcodeproj \
+            -scheme LINGVERSE \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            build 2>&1 | tee build.log
+
+      - name: Package IPA
+        run: |
+          APP_PATH=$(find build/Build/Products -maxdepth 2 -name "LINGVERSE.app" -type d | head -n 1)
+          echo "App bundle: $APP_PATH"
+          test -d "$APP_PATH"
+          mkdir -p Payload
+          cp -R "$APP_PATH" Payload/
+          zip -qry LINGVERSE.ipa Payload
+          ls -lh LINGVERSE.ipa
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LINGVERSE-unsigned-ipa
+          path: LINGVERSE.ipa
+          retention-days: 30
+
+      - name: Make tag
+        id: tag
+        run: echo "name=$(date -u +v%Y%m%d-%H%M%S)" >> "$GITHUB_OUTPUT"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: 聆境 LINGVERSE ${{ steps.tag.outputs.name }}
+          body: |
+            **聆境 LINGVERSE** — 听书 App 空壳（未签名 IPA）
+
+            安装方式：使用 AltStore / Sideloadly / ESign / TrollStore 自行签名后安装。
+          files: LINGVERSE.ipa
+          generate_release_notes: false
+
+      - name: Build log on failure
+        if: failure()
+        run: tail -n 80 build.log || true
