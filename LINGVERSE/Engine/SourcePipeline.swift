@@ -112,7 +112,7 @@ final class SourcePipeline {
             urlCtx.body = body
             let rawURL = RuleEngine.eval(rule.bookUrl, urlCtx, json: item).string
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-            let bookURL = absolute(rawURL, base: url) ?? rawURL
+            let bookURL = absolute(rawURL, base: spec.url) ?? rawURL
             return SearchResult(
                 name: name,
                 author: RuleEngine.eval(rule.author, itemCtx, json: item).string,

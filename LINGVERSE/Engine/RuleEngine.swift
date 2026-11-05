@@ -122,7 +122,7 @@ enum RuleEngine {
         // 形式三：@js: ... 后面跟一行以 $ 开头的路径（没有 </js> 闭合）
         if text.hasPrefix("@js:") {
             let body = String(text.dropFirst(4))
-            let lines = body.split(whereSeparator: { $0 == "\n" }, omittingEmptySubsequences: false)
+            let lines = body.split(omittingEmptySubsequences: false, whereSeparator: { $0 == "\n" })
             if let last = lines.last {
                 let tail = String(last).trimmingCharacters(in: .whitespaces)
                 if tail.hasPrefix("$") && tail.count < 40 && !tail.contains(" "),
