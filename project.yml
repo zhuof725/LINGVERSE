@@ -1,0 +1,52 @@
+# 聆境 LINGVERSE — 听书 App 空壳
+# 本地生成工程： brew install xcodegen && xcodegen generate
+name: LINGVERSE
+
+options:
+  bundleIdPrefix: com.zhuof725
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    TARGETED_DEVICE_FAMILY: "1,2"
+    IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+
+targets:
+  LINGVERSE:
+    type: application
+    platform: iOS
+    sources:
+      - path: LINGVERSE
+    settings:
+      base:
+        PRODUCT_NAME: LINGVERSE
+        PRODUCT_BUNDLE_IDENTIFIER: com.zhuof725.lingverse
+        CODE_SIGN_STYLE: Automatic
+        ENABLE_BITCODE: NO
+    info:
+      path: Support/Info.plist
+      properties:
+        CFBundleDisplayName: 聆境
+        CFBundleShortVersionString: "1.0"
+        CFBundleVersion: "1"
+        UILaunchScreen: {}
+        # 后台播放预留
+        UIBackgroundModes:
+          - audio
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+
+schemes:
+  LINGVERSE:
+    build:
+      targets:
+        LINGVERSE: all
+    run:
+      config: Debug
+    archive:
+      config: Release
