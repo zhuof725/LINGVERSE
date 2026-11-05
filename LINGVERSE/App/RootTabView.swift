@@ -6,8 +6,11 @@ import SwiftUI
 /// 上一版挂在 TabView 上，insets 会被 TabBar 吃掉，条子跑到 TabBar 底下。
 struct RootTabView: View {
     @EnvironmentObject private var player: PlayerViewModel
-    @StateObject private var store = SourceStore.shared
-    @StateObject private var library = LibraryStore.shared
+    // 这两个是全局单例：用 @ObservedObject 观察它们的变化，
+    // 不要用 @StateObject —— 那等于让 View「拥有」单例，
+    // View 重建时会重新走一遍单例初始化路径，语义是错的。
+    @ObservedObject private var store = SourceStore.shared
+    @ObservedObject private var library = LibraryStore.shared
 
     @State private var selectedTab: AppTab = .library
     @State private var isPlayerPresented = false
@@ -46,6 +49,11 @@ struct RootTabView: View {
             // 支持从「文件」App 或分享面板把书源 JSON 交给 LINGVERSE
             handleIncoming(url)
         }
+        // 注意：必须注入到 TabView **外层**。
+        // 只加在某个 Tab 内部的话，sheet 里弹出的 PlayerView 拿不到这些对象，
+        // 而 @EnvironmentObject 取不到会直接触发 SwiftUI 的断言崩溃（不是返回 nil）。
+        .environmentObject(store)
+        .environmentObject(library)
     }
 
     private func handleIncoming(_ url: URL) {
