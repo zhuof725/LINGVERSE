@@ -66,26 +66,35 @@ final class SourceStore: ObservableObject {
     // MARK: - 导入
 
     /// 从 JSON 文本导入。既接受数组也接受单个对象（Legado 导出两种都有）。
-    /// 返回解析成功但被我方规则识别为「文本源」的数量，用于提示。
+    ///
+    /// 真实世界的书源分享长这样，全都得吃下去：
+    /// - 干净的 JSON 数组 / 对象
+    /// - 开头带一段说明文字，中间才是 JSON（`bookSourceUrl` 之后截取）
+    /// - 整段 Base64（很多分享站就是这么给的）
+    /// - 多个对象用换行拼接（一次导入一串）
     @discardableResult
     func importJSON(_ text: String) throws -> ImportReport {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { throw ImportError.empty }
-        guard let data = trimmed.data(using: .utf8) else { throw ImportError.notJSON }
+        let raw = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty else { throw ImportError.empty }
 
-        let decoder = JSONDecoder()
+        let candidates = JSONExtractor.candidates(from: raw)
+        guard !candidates.isEmpty else { throw ImportError.notJSON }
+
         var parsed: [BookSource] = []
+        var lastError: Error = ImportError.badFormat
 
-        if let list = try? decoder.decode([BookSource].self, from: data) {
-            parsed = list
-        } else if let single = try? decoder.decode(BookSource.self, from: data) {
-            parsed = [single]
-        } else {
-            throw ImportError.badFormat
+        for candidate in candidates {
+            do {
+                parsed = try decodeSources(from: candidate)
+                if !parsed.isEmpty { break }
+            } catch {
+                lastError = error
+            }
         }
+        guard !parsed.isEmpty else { throw lastError }
 
-        // 完全没识别出规则的，多半不是书源文件
-        parsed = parsed.filter { $0.bookSourceUrl.isEmpty == false || $0.bookSourceName.isEmpty == false }
+        // 彻底没识别出源信息的（既无 url 又无 name）是脏数据
+        parsed = parsed.filter { !$0.bookSourceUrl.isEmpty || !$0.bookSourceName.isEmpty }
         guard !parsed.isEmpty else { throw ImportError.badFormat }
 
         let result = upsert(parsed)
@@ -97,6 +106,41 @@ final class SourceStore: ObservableObject {
             textOnly: textOnly.count,
             textOnlyNames: textOnly.prefix(3).map(\.bookSourceName)
         )
+    }
+
+    /// 解码成书源数组。支持单一 JSON、数组、以及「多个 JSON 对象换行拼接」。
+    private func decodeSources(from text: String) throws -> [BookSource] {
+        let decoder = JSONDecoder()
+        guard let data = text.data(using: .utf8) else { throw ImportError.notJSON }
+
+        if let list = try? decoder.decode([BookSource].self, from: data), !list.isEmpty {
+            return list
+        }
+        if let single = try? decoder.decode(BookSource.self, from: data) {
+            return [single]
+        }
+        // 换行拼接的多个对象：按行拆，逐行解
+        if let object = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]),
+           let dict = object as? [String: Any],
+           dict["bookSourceUrl"] != nil || dict["bookSourceName"] != nil {
+            // 已经是字典但没解成 BookSource，说明字段类型有严重问题
+            if let re = try? JSONSerialization.data(withJSONObject: [dict]),
+               let list = try? decoder.decode([BookSource].self, from: re) {
+                return list
+            }
+        }
+        // 逐行尝试（一行一个书源）
+        var collected: [BookSource] = []
+        for line in text.split(separator: "\n") {
+            let t = line.trimmingCharacters(in: .whitespaces)
+            guard t.hasPrefix("{") else { continue }
+            if let d = t.data(using: .utf8),
+               let one = try? decoder.decode(BookSource.self, from: d) {
+                collected.append(one)
+            }
+        }
+        if !collected.isEmpty { return collected }
+        throw ImportError.badFormat
     }
 
     struct ImportReport {

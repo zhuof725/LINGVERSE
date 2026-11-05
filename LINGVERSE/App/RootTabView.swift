@@ -50,11 +50,19 @@ struct RootTabView: View {
 
     private func handleIncoming(_ url: URL) {
         guard url.isFileURL else { return }
-        guard let data = try? Data(contentsOf: url),
-              let text = String(data: data, encoding: .utf8) else { return }
+        // 从「文件」App / 分享面板进来的文件需要安全作用域权限，否则读出来是空
+        let needsScope = url.startAccessingSecurityScopedResource()
+        defer { if needsScope { url.stopAccessingSecurityScopedResource() } }
+
+        guard let data = try? Data(contentsOf: url) else {
+            Diagnostics.shared.add("import", "读取失败: \(url.lastPathComponent)")
+            return
+        }
+        // 分享文本未必是 UTF-8，走和导入页一样的编码嗅探
+        let text = HTTPClient.decode(data, response: nil)
         do {
             let report = try SourceStore.shared.importJSON(text)
-            Diagnostics.shared.add("import", report.summary)
+            Diagnostics.shared.add("import", "\(url.lastPathComponent): " + report.summary)
             selectedTab = .profile
         } catch {
             Diagnostics.shared.add("import", "失败: \(error.localizedDescription)")
