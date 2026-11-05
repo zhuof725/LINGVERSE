@@ -33,9 +33,11 @@ targets:
         CFBundleShortVersionString: "1.0"
         CFBundleVersion: "1"
         UILaunchScreen: {}
-        # 后台播放预留
+        # 后台播放
         UIBackgroundModes:
           - audio
+        # 只支持竖屏：iPad 分屏要求支持全部方向，声明全屏即可消除该警告
+        UIRequiresFullScreen: true
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
         UIApplicationSceneManifest:

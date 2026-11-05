@@ -1,37 +1,79 @@
 import SwiftUI
 
-/// 书库（书架）页 —— 空壳占位
-/// 展示占位书籍网格，点击即载入播放（仅更新全局状态）。
+/// 书库 = 书架。展示已收藏的书，点击继续播放。
 struct LibraryView: View {
+    @EnvironmentObject private var library: LibraryStore
     @EnvironmentObject private var player: PlayerViewModel
 
-    // 占位数据（空壳阶段用，后续替换为真实数据源）
-    private let sampleBooks: [Book] = [
-        Book(title: "三体", author: "刘慈欣", category: "科幻"),
-        Book(title: "活着", author: "余华", category: "文学"),
-        Book(title: "明朝那些事儿", author: "当年明月", category: "历史")
-    ]
-
-    private let columns = [GridItem(.adaptive(minimum: 110), spacing: 16)]
+    private let columns = [GridItem(.adaptive(minimum: 104), spacing: 16)]
 
     var body: some View {
         NavigationStack {
-            ScrollView {
-                LazyVGrid(columns: columns, spacing: 20) {
-                    ForEach(sampleBooks) { book in
-                        BookCardView(book: book) {
-                            player.load(book: book)
+            Group {
+                if library.books.isEmpty {
+                    ContentUnavailableView {
+                        Label("书架是空的", systemImage: "books.vertical")
+                    } description: {
+                        Text("去「书城」搜索有声书，点右上角 ⊕ 加入书架。")
+                    }
+                } else {
+                    ScrollView {
+                        LazyVGrid(columns: columns, spacing: 18) {
+                            ForEach(library.books) { book in
+                                BookCardView(book: book, isPlaying: player.currentBook?.bookUrl == book.bookUrl) {
+                                    resume(book)
+                                }
+                            }
                         }
+                        .padding()
                     }
                 }
-                .padding()
             }
             .navigationTitle("书库")
+            .toolbar {
+                if !library.books.isEmpty {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        EditButton()
+                    }
+                }
+            }
         }
     }
-}
 
-#Preview {
-    LibraryView()
-        .environmentObject(PlayerViewModel())
+    private func resume(_ book: LBook) {
+        // 已经切到别的书：让用户去详情页选章节，比这里猜一章更符合预期
+        if player.currentBook?.bookUrl == book.bookUrl {
+            player.togglePlay()
+            return
+        }
+        // 同书不同章不重复加载
+        Task {
+            guard let source = SourceStore.shared.sources.first(where: { $0.id == book.sourceId }) else {
+                Diagnostics.shared.add("library", "书源不存在: \(book.sourceName)")
+                return
+            }
+            do {
+                let detail = BookDetail(
+                    bookUrl: book.bookUrl, name: book.name, author: book.author,
+                    intro: book.intro, kind: book.kind, coverUrl: book.coverUrl,
+                    lastChapter: book.lastChapter, wordCount: nil, tocUrl: nil)
+                let chapters = try await Task.detached(priority: .userInitiated) {
+                    try SourcePipeline.shared.toc(detail, source: source)
+                }.value
+                guard let first = chapters.first else { return }
+                let urls = try await Task.detached(priority: .userInitiated) {
+                    try SourcePipeline.shared.playURLs(chapter: first, detail: detail, source: source)
+                }.value
+                guard let url = urls.first.flatMap(URL.init(string:)) else { return }
+                player.load(
+                    book: book,
+                    chapter: LChapter(index: first.index, title: first.title, url: first.url),
+                    audioURL: url,
+                    allChapters: chapters.map { LChapter(index: $0.index, title: $0.title, url: $0.url) }
+                )
+            } catch {
+                Diagnostics.shared.add("library", "打开失败: \(error.localizedDescription)")
+            }
+        }
+    }
 }

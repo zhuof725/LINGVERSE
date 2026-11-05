@@ -1,0 +1,272 @@
+import Foundation
+
+/// 规则求值上下文。对应 Legado 的 AnalyzeUrl / RuleData 执行环境。
+struct RuleContext {
+    /// 当前请求/响应地址，相对链接按它补全。
+    var baseURL: String = ""
+    /// 当前响应全文（HTML 或 JSON 文本）。
+    var body: String = ""
+    /// 搜索关键字。
+    var key: String = ""
+    /// 翻页页码。
+    var page: Int = 1
+    /// `{{book.name}}` 这类书信息模板。
+    var book: [String: String] = [:]
+    /// `{{chapter.title}}`。
+    var chapter: [String: String] = [:]
+    /// jsLib 与源内变量（`source.getVariable()` 等）。
+    var vars: [String: String] = [:]
+}
+
+/// 规则执行结果。
+enum RuleValue {
+    case text(String)
+    case list([[String: Any]])
+
+    var string: String {
+        switch self {
+        case .text(let s): return s
+        case .list(let items): return items.map { RuleValue.text(in: $0).string }.joined(separator: "\n")
+        }
+    }
+
+    /// 从字典取第一个可渲染的文本值（优先常见字段名，否则取第一个字符串值）。
+    static func text(in item: [String: Any]) -> RuleValue {
+        for key in ["text", "value", "name", "title", "content"] {
+            if let s = item[key] as? String { return .text(s) }
+        }
+        for (_, value) in item.sorted(by: { $0.key < $1.key }) {
+            if let s = value as? String { return .text(s) }
+        }
+        return .text("")
+    }
+}
+
+/// Legado 规则求值器。
+///
+/// 只实现 LINGVERSE 需要的一条链路：搜索 / 详情 / 目录 / 章节地址。
+/// 刻意不做：@css 完整 XPath、段评、登录 UI、explore 富文本布局。
+/// 遇到不支持的规则形态一律返回空串并记一条诊断，绝不把"求值失败"当成"字段为空"吞掉。
+enum RuleEngine {
+
+    // MARK: - 入口
+
+    /// 解析单条规则。`ctx.body` 为当前响应，`json` 传 nil 时按需把 body 解析成 JSON 对象。
+    static func eval(_ rule: String?, _ ctx: RuleContext, json: Any? = nil) -> RuleValue {
+        guard var text = rule?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else {
+            return .text("")
+        }
+
+        // 1) 纯脚本规则（@js: / <js>）——整条规则交给 JS 引擎
+        if let script = RuleScanner.scriptBody(text) {
+            let ctxJSON = json ?? RuleEngine.parseJSON(ctx.body)
+            let out = JSRunner.shared.run(script, ctx: ctx, json: ctxJSON)
+            return .text(out)
+        }
+
+        // 2) `selector@js:...` —— 先求选择器，再把结果作为 result 交给脚本
+        if let range = valueScriptSplit(text) {
+            let selector = String(text[..<range.lowerBound])
+            let script = String(text[range.upperBound...])
+            let prev = eval(selector, ctx, json: json)
+            let ctxJSON = json ?? RuleEngine.parseJSON(ctx.body)
+            let out = JSRunner.shared.run(script, ctx: ctx, json: ctxJSON, result: prev.string)
+            return .text(out)
+        }
+
+        // 3) 模板：把 {{expr}} 先替换成求值结果，剩余规则当普通选择器
+        text = expandTemplate(text, ctx: ctx, json: json)
+
+        // 4) 管道：`@@` 只取首项 / `##` 正则替换 / `&&` 交集
+        return evalPipeline(text, ctx: ctx, json: json)
+    }
+
+    /// 求一个列表规则（bookList / chapterList），返回字典数组。
+    /// 结果里每个元素都会带上 `__text` 与 `__html` 便于下游按需取值。
+    static func evalList(_ rule: String?, _ ctx: RuleContext, json: Any? = nil) -> [[String: Any]] {
+        guard let rule, !rule.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return [] }
+        let ctxJSON = json ?? parseJSON(ctx.body)
+        // 纯 JS 规则可能直接返回数组
+        if RuleScanner.scriptBody(rule) != nil {
+            let out = JSRunner.shared.runList(rule, ctx: ctx, json: ctxJSON)
+            return out
+        }
+        // JSON 数组路径
+        if let obj = ctxJSON {
+            let nodes = jsonPathNodes(rule, obj)
+            if !nodes.isEmpty {
+                return nodes.compactMap { $0 as? [String: Any] }
+            }
+        }
+        return []
+    }
+
+    // MARK: - JSONPath
+
+    /// 把规则里的 `$.` 前缀去掉后走 JsonPath。`body.data[*].books` 这种不带 `$` 的写法也接受。
+    static func jsonPathNodes(_ path: String, _ root: Any) -> [Any] {
+        var p = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !p.isEmpty else { return [] }
+        if p.hasPrefix("$") { /* JsonPath.parse 接受 $ */ }
+        else { p = "$." + p }
+        return JsonPath.query(root, p)
+    }
+
+    static func parseJSON(_ text: String) -> Any? {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let first = t.first, first == "{" || first == "[" else { return nil }
+        guard let data = t.data(using: .utf8) else { return nil }
+        return try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
+    }
+
+    // MARK: - 模板
+
+    /// 展开 `{{expression}}`。表达式支持：
+    /// - `$.field.path`（相对当前 JSON）
+    /// - `key` / `page` / `book.name` / `chapter.url`
+    /// - `baseUrl` / `host` 等源变量
+    static func expandTemplate(_ text: String, ctx: RuleContext, json: Any? = nil) -> String {
+        guard text.contains("{{") else { return text }
+        var out = ""
+        var i = text.startIndex
+        while i < text.endIndex {
+            guard let open = text[i...].range(of: "{{") else {
+                out += String(text[i...])
+                break
+            }
+            out += String(text[i..<open.lowerBound])
+            guard let close = text[open.upperBound...].range(of: "}}") else {
+                out += String(text[open.lowerBound...])
+                break
+            }
+            let expr = String(text[open.upperBound..<close.lowerBound])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            out += resolveTemplate(expr, ctx: ctx, json: json)
+            i = close.upperBound
+        }
+        return out
+    }
+
+    private static func resolveTemplate(_ expr: String, ctx: RuleContext, json: Any?) -> String {
+        // `$...` 或 `$.` → JSONPath
+        if expr.hasPrefix("$") {
+            guard let obj = json ?? parseJSON(ctx.body) else { return "" }
+            let nodes = jsonPathNodes(expr.hasPrefix("$.") ? String(expr.dropFirst()) : expr, obj)
+            if nodes.count == 1, let s = nodes[0] as? String { return s }
+            return nodes.map { scalarString($0) }.joined(separator: ",")
+        }
+        // `@get:{key}` 读变量
+        if expr.hasPrefix("@get:") {
+            let key = String(expr.dropFirst(5)).trimmingCharacters(in: CharacterSet(charactersIn: "{} "))
+            return ctx.vars[key] ?? ""
+        }
+        if expr == "key" { return ctx.key }
+        if expr == "page" { return String(ctx.page) }
+        if expr == "baseUrl" { return ctx.baseURL }
+        if expr.hasPrefix("book.") {
+            return ctx.book[String(expr.dropFirst(5))] ?? ""
+        }
+        if expr.hasPrefix("chapter.") {
+            return ctx.chapter[String(expr.dropFirst(8))] ?? ""
+        }
+        if let v = ctx.vars[expr] { return v }
+        // 未知表达式原样保留，方便在诊断面板里看见是哪条模板没被支持
+        return "{{\(expr)}}"
+    }
+
+    private static func scalarString(_ value: Any) -> String {
+        if let s = value as? String { return s }
+        if let n = value as? NSNumber { return n.stringValue }
+        if value is NSNull { return "" }
+        if let data = try? JSONSerialization.data(withJSONObject: value),
+           let s = String(data: data, encoding: .utf8) { return s }
+        return ""
+    }
+
+    // MARK: - 管道
+
+    /// `@js:` / `@js` 作为“值脚本”出现的位置：`selector@js:script`。
+    private static func valueScriptSplit(_ text: String) -> Range<String.Index>? {
+        guard let r = text.range(of: "@js:") else { return nil }
+        // 只有前面确实有选择器时才算值脚本；`@js:` 在开头的情况由 scriptBody 处理
+        guard r.lowerBound > text.startIndex else { return nil }
+        return r
+    }
+
+    /// 依次执行 `&&`（交集/兜底）与 `##`（正则替换）。顺序按 Legado：先切 `&&`，再切 `##`。
+    static func evalPipeline(_ rule: String, ctx: RuleContext, json: Any? = nil) -> RuleValue {
+        let andSplit = RuleScanner.split(rule, by: ["&&"])
+        if andSplit.valid && andSplit.parts.count > 1 {
+            // 交集：取第一个非空结果；全空则返回空
+            var last = ""
+            for part in andSplit.parts {
+                let v = evalPipeline(part, ctx: ctx, json: json)
+                let s = v.string
+                if !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return v }
+                last = s
+            }
+            return .text(last)
+        }
+
+        // `##regex##replacement` 两段式 + `##regex` 单段式
+        let hashSplit = RuleScanner.split(rule, by: ["##"])
+        if hashSplit.valid && hashSplit.parts.count > 1 {
+            let selector = hashSplit.parts[0]
+            let base = evalSelector(selector, ctx: ctx, json: json).string
+            var value = base
+            var k = 1
+            while k < hashSplit.parts.count {
+                let pattern = hashSplit.parts[k]
+                let replacement = (k + 1 < hashSplit.parts.count) ? hashSplit.parts[k + 1] : ""
+                if pattern.isEmpty {
+                    k += 2
+                    continue
+                }
+                value = regexReplace(value, pattern: pattern, replacement: replacement)
+                k += 2
+            }
+            return .text(value)
+        }
+
+        return evalSelector(rule, ctx: ctx, json: json)
+    }
+
+    private static func regexReplace(_ text: String, pattern: String, replacement: String) -> String {
+        guard let re = try? NSRegularExpression(pattern: pattern, options: [.dotMatchesLineSeparators]) else {
+            return text
+        }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        // Legado 里 `##a##b` 的 b 是替换串，`$1` 这类反向引用要生效
+        return re.stringByReplacingMatches(in: text, options: [], range: range, withTemplate: replacement)
+    }
+
+    // MARK: - 选择器
+
+    /// 单个选择器：`$.json.path` 或裸字段名（按 JSON 处理）。HTML/XPath 在本期范围外。
+    private static func evalSelector(_ selector: String, ctx: RuleContext, json: Any? = nil) -> RuleValue {
+        let s = selector.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !s.isEmpty else { return .text("") }
+
+        // `@get:{key}` / `@put:{...}` 抽出来单处理
+        if s.hasPrefix("@get:") {
+            let key = String(s.dropFirst(5)).trimmingCharacters(in: CharacterSet(charactersIn: "{} "))
+            return .text(ctx.vars[key] ?? "")
+        }
+
+        // 形如 `body.books` 或 `$.body.books` 的 JSON 路径
+        let candidates = [s, s.hasPrefix("$") ? String(s.dropFirst()) : "$." + s]
+        for cand in candidates {
+            if let obj = json ?? parseJSON(ctx.body) {
+                let nodes = JsonPath.query(obj, cand.hasPrefix("$") ? cand : "$." + cand)
+                if !nodes.isEmpty {
+                    if nodes.count == 1, let str = nodes[0] as? String { return .text(str) }
+                    return .text(nodes.map { scalarString($0) }.joined(separator: "\n"))
+                }
+            }
+        }
+
+        // 裸字段名但 body 不是 JSON → 当纯文本返回（`##regex` 的输入常见）
+        if !ctx.body.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("{") { return .text(s) }
+        return .text("")
+    }
+}
