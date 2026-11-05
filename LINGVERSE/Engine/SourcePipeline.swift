@@ -118,7 +118,7 @@ final class SourcePipeline {
 
         // init 规则：有些源靠它把 bookUrl 换成真实详情接口
         var detailURL = bookURL
-        if let initRule = rule?.init, !initRule.isEmpty {
+        if let initRule = rule?.`init`, !initRule.isEmpty {
             ctx.body = HTTPClient.shared.get(bookURL) ?? ""
             if let resolved = expandURL(initRule, ctx: ctx, json: RuleEngine.parseJSON(ctx.body)) {
                 detailURL = resolved
