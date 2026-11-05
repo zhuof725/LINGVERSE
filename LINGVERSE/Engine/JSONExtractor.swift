@@ -67,9 +67,10 @@ enum JSONExtractor {
                 } else if c == "}" || c == "]" {
                     depth -= 1
                     if depth == 0 {
-                        lastBalancedEnd = text.index(after: i)
+                        let end = text.index(after: i)
+                        lastBalancedEnd = end
                         // 继续往后看，可能是拼接的第二个 JSON 数组
-                        let rest = text[lastBalancedEnd...].trimmingCharacters(in: .whitespacesAndNewlines)
+                        let rest = text[end...].trimmingCharacters(in: .whitespacesAndNewlines)
                         if rest.isEmpty { break }
                     }
                     if depth < 0 { return nil }
