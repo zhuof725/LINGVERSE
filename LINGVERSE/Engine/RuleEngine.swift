@@ -16,6 +16,8 @@ struct RuleContext {
     var chapter: [String: String] = [:]
     /// jsLib 与源内变量（`source.getVariable()` 等）。
     var vars: [String: String] = [:]
+    /// 书源自带的 jsLib 脚本。每次求值前注入，规则里才能调 `fanqieSignHeaders` 这类函数。
+    var jsLib: String = ""
 }
 
 /// 规则执行结果。

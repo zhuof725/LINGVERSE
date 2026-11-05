@@ -11,27 +11,36 @@ final class SourcePipeline {
 
     // MARK: - URL 构造
 
-    /// 展开 searchUrl / tocUrl 这类「URL 规则」，返回补全后的绝对地址。
-    /// 支持 `@js:` 脚本、`{{key}}` `{{page}}` 模板、`{{$.field}}` JSON 引用。
-    func expandURL(_ rule: String, ctx: RuleContext, json: Any? = nil) -> String? {
+    /// 展开 searchUrl / tocUrl 这类「URL 规则」，返回可执行的请求。
+    ///
+    /// 返回值可能是 `url, {"method":"POST","headers":{...}}` ——
+    /// API 型书源（番茄等）几乎全靠这个约定把签名头带进去。
+    func expandRequest(_ rule: String, ctx: RuleContext, json: Any? = nil) throws -> RequestSpec {
         let text = rule.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return nil }
+        guard !text.isEmpty else { throw SourceError.missingRule("URL 规则") }
 
         let expanded: String
         if let script = RuleScanner.scriptBody(text) {
             expanded = JSRunner.shared.run(script, ctx: ctx, json: json)
+            // JS 抛异常时返回空串。这里必须区分「脚本失败」和「脚本返回了空」，
+            // 否则用户看到的是「生成了非法地址」，完全无法定位。
+            if expanded.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                let reason = JSRunner.shared.lastError ?? "脚本返回空"
+                throw SourceError.scriptFailed(reason)
+            }
         } else {
             expanded = RuleEngine.expandTemplate(text, ctx: ctx, json: json)
         }
-        let trimmed = expanded.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-        // 脚本可能返回带换行的多行文本，取第一行像 URL 的
-        for line in trimmed.split(whereSeparator: { $0 == "\n" || $0 == "\r" }) {
-            let candidate = String(line).trimmingCharacters(in: .whitespaces)
-            if candidate.lowercased().hasPrefix("http") { return candidate }
+
+        guard let spec = RequestSpec.parse(expanded, base: ctx.baseURL) else {
+            throw SourceError.badURL(expanded)
         }
-        if trimmed.lowercased().hasPrefix("http") { return trimmed }
-        return absolute(trimmed, base: ctx.baseURL)
+        return spec
+    }
+
+    /// 兼容旧调用：只要 URL。
+    func expandURL(_ rule: String, ctx: RuleContext, json: Any? = nil) -> String? {
+        try? expandRequest(rule, ctx: ctx, json: json).url
     }
 
     /// 相对地址补全。`//cdn.x/a` 补成 https。
@@ -69,17 +78,25 @@ final class SourcePipeline {
         var ctx = RuleContext(baseURL: baseURL(of: source), key: keyword, page: page)
         ctx.vars["key"] = keyword
         ctx.vars["page"] = String(page)
+        // jsLib 里是签名函数和常量，规则脚本直接调用它
+        ctx.jsLib = source.jsLib ?? ""
+        ctx.vars["__sourceUrl"] = source.bookSourceUrl
+        ctx.vars["__sourceName"] = source.bookSourceName
+        ctx.vars["__sourceKey"] = source.bookSourceUrl
 
-        guard let url = expandURL(searchRuleText, ctx: ctx) else {
-            throw SourceError.badURL(searchRuleText)
+        let spec = try expandRequest(searchRuleText, ctx: ctx)
+        Diagnostics.shared.add("search", "\(source.bookSourceName) → \(spec.method) \(spec.url)")
+        if !spec.headers.isEmpty {
+            Diagnostics.shared.add("search", "headers: \(spec.headers.keys.sorted().joined(separator: ", "))")
         }
-        Diagnostics.shared.add("search", "\(source.bookSourceName) → \(url)")
 
-        guard let body = HTTPClient.shared.get(url, timeout: 20) else {
-            throw SourceError.requestFailed(url)
+        guard let body = HTTPClient.shared.request(
+            spec.url, method: spec.method, body: spec.body, headers: spec.headers, timeout: 25
+        ) else {
+            throw SourceError.requestFailed(spec.url)
         }
         ctx.body = body
-        ctx.baseURL = url
+        ctx.baseURL = spec.url
         let json = RuleEngine.parseJSON(body)
 
         let items = RuleEngine.evalList(rule.bookList, ctx, json: json)
@@ -115,17 +132,27 @@ final class SourcePipeline {
         let rule = source.ruleBookInfo
         var ctx = RuleContext(baseURL: bookURL)
         ctx.book = ["name": hint?.name ?? ""]
+        ctx.jsLib = source.jsLib ?? ""
+        ctx.vars["__sourceUrl"] = source.bookSourceUrl
+        ctx.vars["__sourceName"] = source.bookSourceName
+        ctx.vars["__sourceKey"] = source.bookSourceUrl
 
-        // init 规则：有些源靠它把 bookUrl 换成真实详情接口
+        // init 规则：有些源靠它把 bookUrl 换成真实详情接口（常带签名头）
         var detailURL = bookURL
+        var detailSpec: RequestSpec?
         if let initRule = rule?.`init`, !initRule.isEmpty {
             ctx.body = HTTPClient.shared.get(bookURL) ?? ""
-            if let resolved = expandURL(initRule, ctx: ctx, json: RuleEngine.parseJSON(ctx.body)) {
-                detailURL = resolved
-            }
+            detailSpec = try? expandRequest(initRule, ctx: ctx, json: RuleEngine.parseJSON(ctx.body))
+            if let spec = detailSpec { detailURL = spec.url }
         }
 
-        let body = HTTPClient.shared.get(detailURL) ?? ""
+        let body: String
+        if let spec = detailSpec {
+            body = HTTPClient.shared.request(spec.url, method: spec.method, body: spec.body,
+                                             headers: spec.headers, timeout: 25) ?? ""
+        } else {
+            body = HTTPClient.shared.get(detailURL) ?? ""
+        }
         ctx.body = body
         ctx.baseURL = detailURL
         let json = RuleEngine.parseJSON(body)
@@ -148,9 +175,16 @@ final class SourcePipeline {
         )
         ctx.book = ["name": detail.name, "author": detail.author]
 
-        // 目录地址：优先 tocUrl 规则，否则就当 bookUrl 本身是目录页
+        // 目录地址：优先 tocUrl 规则，否则就当 bookUrl 本身是目录页。
+        // tocUrl 规则往往产出「URL + 签名头」的 POST 请求，光存 URL 会丢掉 headers，
+        // 所以返回的 detail 里把整个 spec 带上，toc() 直接用。
         if let tocRule = rule?.tocUrl, !tocRule.isEmpty {
-            detail.tocUrl = expandURL(tocRule, ctx: ctx, json: json) ?? detailURL
+            if let spec = try? expandRequest(tocRule, ctx: ctx, json: json) {
+                detail.tocRequest = spec
+                detail.tocUrl = spec.url
+            } else {
+                detail.tocUrl = detailURL
+            }
         } else {
             detail.tocUrl = detailURL
         }
@@ -164,8 +198,20 @@ final class SourcePipeline {
         let tocURL = detail.tocUrl ?? detail.bookUrl
         var ctx = RuleContext(baseURL: tocURL)
         ctx.book = ["name": detail.name, "author": detail.author]
+        ctx.jsLib = source.jsLib ?? ""
+        ctx.vars["__sourceUrl"] = source.bookSourceUrl
+        ctx.vars["__sourceName"] = source.bookSourceName
+        ctx.vars["__sourceKey"] = source.bookSourceUrl
 
-        guard let body = HTTPClient.shared.get(tocURL) else {
+        let body: String?
+        if let spec = detail.tocRequest {
+            Diagnostics.shared.add("toc", "\(spec.method) \(spec.url.prefix(100))")
+            body = HTTPClient.shared.request(spec.url, method: spec.method, body: spec.body,
+                                             headers: spec.headers, timeout: 25)
+        } else {
+            body = HTTPClient.shared.get(tocURL)
+        }
+        guard let body else {
             throw SourceError.requestFailed(tocURL)
         }
         ctx.body = body
@@ -220,8 +266,20 @@ final class SourcePipeline {
         var ctx = RuleContext(baseURL: chapterURL)
         ctx.book = ["name": detail.name, "author": detail.author]
         ctx.chapter = ["title": chapter.title, "index": String(chapter.index), "url": chapterURL]
+        ctx.jsLib = source.jsLib ?? ""
+        ctx.vars["__sourceUrl"] = source.bookSourceUrl
+        ctx.vars["__sourceName"] = source.bookSourceName
+        ctx.vars["__sourceKey"] = source.bookSourceUrl
 
-        guard let body = HTTPClient.shared.get(chapterURL) else {
+        // 章节地址可能是「URL + 签名头」，也可能是普通的页面 URL。
+        // 先用章节地址抓一次，拿不到再退回纯 GET。
+        var body: String?
+        if let spec = try? RequestSpec.parse(chapterURL, base: chapterURL) {
+            body = HTTPClient.shared.request(spec.url, method: spec.method, body: spec.body,
+                                             headers: spec.headers, timeout: 25)
+        }
+        if body == nil { body = HTTPClient.shared.get(chapterURL) }
+        guard let body else {
             if AudioURL.isDirect(chapterURL) { return [chapterURL] }
             throw SourceError.requestFailed(chapterURL)
         }
@@ -264,6 +322,9 @@ struct BookDetail {
     var lastChapter: String?
     var wordCount: String?
     var tocUrl: String?
+    /// 目录请求的完整参数。tocUrl 规则常产出带签名头的 POST，
+    /// 只存 URL 会让 toc() 重新发明一次请求，签名就失效了。
+    var tocRequest: RequestSpec?
 }
 
 struct SourceChapter: Identifiable, Hashable {
@@ -280,12 +341,17 @@ enum SourceError: LocalizedError {
     case missingRule(String)
     case badURL(String)
     case requestFailed(String)
+    /// 规则脚本抛异常。必须和 badURL 分开：
+    /// 真实原因通常是 jsLib 缺失、宿主 API 没实现、或签名算法报错，
+    /// 混成「非法地址」会把最有价值的信息丢掉。
+    case scriptFailed(String)
 
     var errorDescription: String? {
         switch self {
         case .missingRule(let name): return "书源缺少 \(name) 规则"
-        case .badURL(let raw): return "规则生成了非法地址：\(raw.prefix(80))"
-        case .requestFailed(let url): return "请求失败：\(url.prefix(80))"
+        case .badURL(let raw): return "规则没有产出合法地址：\(raw.prefix(120))"
+        case .requestFailed(let url): return "请求失败：\(url.prefix(120))"
+        case .scriptFailed(let reason): return "规则脚本执行失败：\(reason.prefix(200))"
         }
     }
 }

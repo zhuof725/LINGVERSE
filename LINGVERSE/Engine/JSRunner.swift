@@ -16,8 +16,16 @@ final class JSRunner {
     /// JSContext 不保证线程安全，规则求值统一串行。
     private let lock = NSRecursiveLock()
 
+    /// 规则变量表：`java.put(k,v)` 写入，`java.get(k)` 读出。
+    /// 必须在多个规则之间共享 —— 书源常见做法是在 bookInfo 里 put 一个 id，
+    /// 到 toc 规则里再 get 出来拼 URL。每次求值新建 JSContext 的话这里必须由原生侧持有。
+    private var ruleVars: [String: String] = [:]
+
     /// 最近一次执行的异常文本，供调试面板展示。
     private(set) var lastError: String?
+
+    /// `source.setVariable(...)` 最近写入的值。legado 用它存跨次会话的源状态。
+    private(set) var lastSourceVariable: String?
 
     private init() {}
 
@@ -107,6 +115,23 @@ final class JSRunner {
         context.setObject(sha256, forKeyedSubscript: "__sha256" as NSString)
         context.setObject(log, forKeyedSubscript: "__log" as NSString)
 
+        // 规则变量：把原生侧的表序列化进去，求值结束后再回收。
+        // 这样 java.put 在 bookInfo 里写的 book_id，toc 规则里才 get 得到。
+        let ruleVarsJSON = (try? JSONSerialization.data(withJSONObject: ruleVars))
+            .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+        context.evaluateScript("var __ruleVars = \(ruleVarsJSON);")
+
+        let setSourceVar: @convention(block) (String) -> Void = { [weak self] value in
+            self?.lastSourceVariable = value
+        }
+        context.setObject(setSourceVar, forKeyedSubscript: "__setSourceVar" as NSString)
+
+        // java.put 必须回写到原生表，否则 JSContext 一销毁，bookInfo 里 put 的 id 就没了
+        let putRuleVar: @convention(block) (String, String) -> Void = { [weak self] key, value in
+            self?.ruleVars[key] = value
+        }
+        context.setObject(putRuleVar, forKeyedSubscript: "__putRuleVar" as NSString)
+
         // 变量：key / page / baseUrl / 源变量 / book / chapter / result
         context.setObject(ctx.key, forKeyedSubscript: "key" as NSString)
         context.setObject(ctx.page, forKeyedSubscript: "page" as NSString)
@@ -129,6 +154,19 @@ final class JSRunner {
             Diagnostics.shared.add("js", "prelude failed: \(error)")
             lastError = nil
         }
+
+        // jsLib 必须在 prelude 之后、规则之前注入：
+        // 真实书源的 jsLib 里定义了签名函数和常量（fanqieSignHeaders / FQ_IID 等），
+        // 规则脚本直接调用它们。少这一步，任何 API 型书源都会报 undefined is not a function。
+        if !ctx.jsLib.isEmpty {
+            context.evaluateScript(ctx.jsLib, withSourceURL: URL(string: "lingverse://jslib.js"))
+            if let error = context.exception {
+                lastError = error.toString() ?? "unknown"
+                Diagnostics.shared.add("js", "jsLib 执行失败: \(lastError ?? "")")
+                context.exception = nil
+            }
+        }
+
         return context
     }
 
@@ -175,14 +213,16 @@ final class JSRunner {
       ajaxAll: function(list) { return __ajaxAll(list); },
       connect: function(u) { return __ajax(String(u)); },
       connectNative: function(u) { return __ajax(String(u)); },
-      get: function(u) { var o = __request(String(u), '{"method":"GET"}'); return o; },
+      put: function(k, v) {
+        __ruleVars[String(k)] = String(v);
+        __putRuleVar(String(k), String(v));
+        return '';
+      },
+      get: function(k) { return (__ruleVars[String(k)] !== undefined) ? __ruleVars[String(k)] : ''; },
       post: function(u, body, headers) {
-        var opt = {method:'POST', body:String(body === undefined ? '' : body)};
+        var opt = {method: 'POST', body: String(body === undefined ? '' : body)};
         if (headers) opt.headers = headers;
         return __request(String(u), JSON.stringify(opt));
-      },
-      put: function(u, body) {
-        return __request(String(u), JSON.stringify({method:'PUT', body:String(body === undefined ? '' : body)}));
       },
       head: function(u) { return __request(String(u), '{"method":"HEAD"}'); },
       base64Encode: function(s) { return __base64Encode(String(s)); },
@@ -236,9 +276,12 @@ final class JSRunner {
       getKey: function() { return (typeof __sourceKey !== 'undefined') ? __sourceKey : ''; },
       getBookSourceUrl: function() { return (typeof __sourceUrl !== 'undefined') ? __sourceUrl : ''; },
       getBookSourceName: function() { return (typeof __sourceName !== 'undefined') ? __sourceName : ''; },
-      getVariable: function() { return ''; },
-      setVariable: function() { return ''; }
+      getVariable: function() { return (typeof __sourceVars !== 'undefined') ? __sourceVars : ''; },
+      setVariable: function(v) { __setSourceVar(String(v)); return ''; }
     };
+
+    // java.put / java.get 共用的规则变量表。legado 用它跨规则传 book_id 这类值。
+    if (typeof __ruleVars === 'undefined') { var __ruleVars = {}; }
 
     var cookie = {
       get: function() { return ''; },
