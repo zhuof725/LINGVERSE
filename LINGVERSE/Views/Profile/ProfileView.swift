@@ -1,41 +1,71 @@
 import SwiftUI
 
-/// 我的 / 设置页 —— 空壳占位
-/// 展示未登录、下载管理、设置的占位列表。
+/// 我的 / 设置。书源管理、书架统计、关于。
 struct ProfileView: View {
+    @EnvironmentObject private var store: SourceStore
+    @EnvironmentObject private var library: LibraryStore
+    @EnvironmentObject private var player: PlayerViewModel
+    @State private var isDiagnosticsPresented = false
+
     var body: some View {
-        NavigationStack {
-            List {
-                Section {
-                    HStack(spacing: 12) {
-                        Circle()
-                            .fill(Color.gray.opacity(0.3))
-                            .frame(width: 48, height: 48)
+        List {
+            Section {
+                NavigationLink {
+                    SourceListView()
+                } label: {
+                    Label {
                         VStack(alignment: .leading, spacing: 2) {
-                            Text("未登录")
-                                .font(.headline)
-                            Text("点击登录（占位）")
+                            Text("书源管理")
+                            Text("\(store.sources.count) 条已导入 · \(store.audioSources.count) 条可用")
                                 .font(.caption)
-                                .foregroundColor(.secondary)
+                                .foregroundStyle(.secondary)
                         }
+                    } icon: {
+                        Image(systemName: "antenna.radiowaves.left.and.right")
                     }
                 }
+            }
 
-                Section("下载管理") {
-                    Text("暂无下载（占位）")
-                        .foregroundColor(.secondary)
-                }
-
-                Section("设置") {
-                    Text("播放设置（占位）")
-                    Text("关于")
+            Section("书架") {
+                LabeledContent("已收藏", value: "\(library.books.count) 本")
+                if let book = player.currentBook {
+                    LabeledContent("正在播放", value: book.name)
                 }
             }
-            .navigationTitle("我的")
+
+            Section("设置") {
+                Button {
+                    isDiagnosticsPresented = true
+                } label: {
+                    Label("运行诊断", systemImage: "stethoscope")
+                }
+                NavigationLink {
+                    AboutView()
+                } label: {
+                    Label("关于", systemImage: "info.circle")
+                }
+            }
+        }
+        .navigationTitle("我的")
+        .sheet(isPresented: $isDiagnosticsPresented) {
+            NavigationStack { DiagnosticsView() }
         }
     }
 }
 
-#Preview {
-    ProfileView()
+struct AboutView: View {
+    var body: some View {
+        List {
+            Section {
+                LabeledContent("名称", value: "聆境 LINGVERSE")
+                LabeledContent("版本", value: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0")
+            }
+            Section {
+                Text("书源格式兼容 Legado。音频源（bookSourceType = 1）可直接导入使用。")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .navigationTitle("关于")
+    }
 }

@@ -1,48 +1,77 @@
 import SwiftUI
 
-/// 根视图：底部 Tab 导航 + 悬浮迷你播放条
-/// 空壳阶段：导航骨架真实，页面内容均为占位。
+/// 根视图：三个 Tab + 迷你播放条。
+///
+/// 迷你条用 `safeAreaInset` 挂在 **TabView 的每个页面里** 而不是 TabView 本身。
+/// 上一版挂在 TabView 上，insets 会被 TabBar 吃掉，条子跑到 TabBar 底下。
 struct RootTabView: View {
     @EnvironmentObject private var player: PlayerViewModel
+    @StateObject private var store = SourceStore.shared
+    @StateObject private var library = LibraryStore.shared
 
     @State private var selectedTab: AppTab = .library
     @State private var isPlayerPresented = false
 
     enum AppTab: Hashable {
-        case library
-        case store
-        case profile
+        case library, store, profile
     }
 
     var body: some View {
         TabView(selection: $selectedTab) {
-            LibraryView()
-                .tabItem { Label("书库", systemImage: "books.vertical") }
-                .tag(AppTab.library)
-
-            StoreView()
-                .tabItem { Label("书城", systemImage: "storefront") }
-                .tag(AppTab.store)
-
-            ProfileView()
-                .tabItem { Label("我的", systemImage: "person") }
-                .tag(AppTab.profile)
-        }
-        // 有播放内容时，在 Tab 栏上方悬浮迷你播放条
-        .safeAreaInset(edge: .bottom) {
-            if player.currentBook != nil {
-                MiniPlayerBar {
-                    isPlayerPresented = true
-                }
+            NavigationStack {
+                LibraryView()
             }
+            .modifier(MiniPlayerInset(isPresented: $isPlayerPresented))
+            .tabItem { Label("书库", systemImage: "books.vertical") }
+            .tag(AppTab.library)
+
+            NavigationStack {
+                StoreView()
+            }
+            .modifier(MiniPlayerInset(isPresented: $isPlayerPresented))
+            .tabItem { Label("书城", systemImage: "storefront") }
+            .tag(AppTab.store)
+
+            NavigationStack {
+                ProfileView()
+            }
+            .modifier(MiniPlayerInset(isPresented: $isPlayerPresented))
+            .tabItem { Label("我的", systemImage: "person") }
+            .tag(AppTab.profile)
         }
         .sheet(isPresented: $isPlayerPresented) {
             PlayerView()
         }
+        .onOpenURL { url in
+            // 支持从「文件」App 或分享面板把书源 JSON 交给 LINGVERSE
+            handleIncoming(url)
+        }
+    }
+
+    private func handleIncoming(_ url: URL) {
+        guard url.isFileURL else { return }
+        guard let data = try? Data(contentsOf: url),
+              let text = String(data: data, encoding: .utf8) else { return }
+        do {
+            let report = try SourceStore.shared.importJSON(text)
+            Diagnostics.shared.add("import", report.summary)
+            selectedTab = .profile
+        } catch {
+            Diagnostics.shared.add("import", "失败: \(error.localizedDescription)")
+        }
     }
 }
 
-#Preview {
-    RootTabView()
-        .environmentObject(PlayerViewModel())
+/// 给页面底部加迷你播放条的 inset。
+private struct MiniPlayerInset: ViewModifier {
+    @EnvironmentObject private var player: PlayerViewModel
+    @Binding var isPresented: Bool
+
+    func body(content: Content) -> some View {
+        content.safeAreaInset(edge: .bottom, spacing: 0) {
+            if player.currentBook != nil {
+                MiniPlayerBar { isPresented = true }
+            }
+        }
+    }
 }
