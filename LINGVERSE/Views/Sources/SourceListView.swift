@@ -5,6 +5,7 @@ struct SourceListView: View {
     @EnvironmentObject private var store: SourceStore
     @State private var isImporterPresented = false
     @State private var isDiagnosticsPresented = false
+    @State private var isCheckPresented = false
     @State private var alert: AlertItem?
     @State private var exportDocument: TextDocument?
 
@@ -52,6 +53,11 @@ struct SourceListView: View {
                     .disabled(store.sources.isEmpty)
                     Divider()
                     Button {
+                        isCheckPresented = true
+                    } label: {
+                        Label("书源体检", systemImage: "checklist")
+                    }
+                    Button {
                         isDiagnosticsPresented = true
                     } label: {
                         Label("运行诊断", systemImage: "stethoscope")
@@ -66,6 +72,9 @@ struct SourceListView: View {
         }
         .sheet(isPresented: $isDiagnosticsPresented) {
             NavigationStack { DiagnosticsView() }
+        }
+        .sheet(isPresented: $isCheckPresented) {
+            NavigationStack { SourceCheckView() }
         }
         .sheet(item: $exportDocument) { doc in
             ShareSheet(items: [doc.text])
@@ -139,12 +148,39 @@ struct SourceImportView: View {
     @EnvironmentObject private var store: SourceStore
     @Environment(\.dismiss) private var dismiss
     @State private var text = ""
+    @State private var urlText = ""
+    @State private var isDownloading = false
     @State private var alert: AlertItem?
 
     var body: some View {
         NavigationStack {
             VStack(alignment: .leading, spacing: 12) {
-                Text("粘贴 Legado 书源 JSON")
+                Text("从链接导入")
+                    .font(.headline)
+                HStack {
+                    TextField("https://…/sources.json", text: $urlText)
+                        .textFieldStyle(.roundedBorder)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .keyboardType(.URL)
+                    Button {
+                        importFromURL()
+                    } label: {
+                        if isDownloading {
+                            ProgressView().scaleEffect(0.8)
+                        } else {
+                            Text("获取")
+                        }
+                    }
+                    .disabled(isDownloading || urlText.trimmingCharacters(in: .whitespaces).isEmpty)
+                }
+                Text("支持 raw.githubusercontent.com、gist、网盘直链等能直接返回 JSON 的地址。")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+
+                Divider().padding(.vertical, 4)
+
+                Text("粘贴书源 JSON")
                     .font(.headline)
                 Text("支持数组或单个对象，可直接粘贴书源分享文本。")
                     .font(.caption)
@@ -154,11 +190,7 @@ struct SourceImportView: View {
                     .font(.system(.caption, design: .monospaced))
                     .scrollContentBackground(.hidden)
                     .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
-                    .frame(minHeight: 240)
-
-                Text("也可以从文件导入：用「文件」App 里的 .json 分享到 LINGVERSE。")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .frame(minHeight: 180)
             }
             .padding()
             .navigationTitle("导入书源")
@@ -175,6 +207,32 @@ struct SourceImportView: View {
             .alert(item: $alert) { item in
                 Alert(title: Text(item.title), message: Text(item.message), dismissButton: .default(Text("好")))
             }
+        }
+    }
+
+    private func importFromURL() {
+        let raw = urlText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: raw) else {
+            alert = AlertItem(title: "地址无效", message: raw)
+            return
+        }
+        isDownloading = true
+        Task {
+            defer { isDownloading = false }
+            guard let body = HTTPClient.shared.get(raw, timeout: 30) else {
+                alert = AlertItem(title: "下载失败", message: "确认链接能在浏览器里直接打开。")
+                return
+            }
+            // 统一下载路径：拿到内容后走同一个导入流程
+            do {
+                let report = try store.importJSON(body)
+                alert = AlertItem(title: "导入完成", message: report.summary)
+                urlText = ""
+            } catch {
+                alert = AlertItem(title: "导入失败",
+                                  message: "\(error.localizedDescription)\n\n返回内容开头：\(body.prefix(120))")
+            }
+            _ = url
         }
     }
 

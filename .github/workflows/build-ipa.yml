@@ -8,6 +8,11 @@ on:
 permissions:
   contents: write
 
+# 连推两次时排队而不是并发跑：并发构建会互相覆盖 Release 产物
+concurrency:
+  group: build-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: macos-15
@@ -61,7 +66,7 @@ jobs:
 
       - name: Make tag
         id: tag
-        run: echo "name=$(date -u +v%Y%m%d-%H%M%S)" >> "$GITHUB_OUTPUT"
+        run: echo "name=v$(date -u +%Y%m%d)-${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
 
       - name: Publish release
         uses: softprops/action-gh-release@v2

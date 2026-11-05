@@ -29,7 +29,10 @@ final class JSRunner {
         defer { lock.unlock() }
         guard let context = makeContext(ctx: ctx, json: json, result: result) else { return "" }
         guard let value = evaluate(script, in: context) else { return "" }
-        return value.isObject ? stringify(value.toObject()) : (value.toString() ?? "")
+        if value.isObject, let object = value.toObject() {
+            return stringify(object)
+        }
+        return value.toString() ?? ""
     }
 
     /// 求值一段返回数组的脚本（bookList / chapterList）。
@@ -66,7 +69,8 @@ final class JSRunner {
             HTTPClient.shared.get(url, timeout: max(1, ms / 1000)) ?? ""
         }
         let ajaxAll: @convention(block) (JSValue) -> [String] = { arr in
-            let urls = (arr.toArray() as? [Any])?.compactMap { $0 as? String } ?? []
+            let raw = arr.toArray() ?? []
+            let urls: [String] = raw.compactMap { $0 as? String }
             return urls.map { HTTPClient.shared.get($0) ?? "" }
         }
         let request: @convention(block) (String, String) -> String = { url, optsJSON in
@@ -253,7 +257,11 @@ final class JSRunner {
 
 // MARK: - 摘要
 
-/// book 源常用 `java.md5Encode` 做签名。用 CommonCrypto，避免手写实现出错。
+/// book 源常用 `java.md5Encode` 做签名。
+///
+/// MD5 在这里不是安全用途 —— 书源作者用它拼接请求参数，
+/// 换成 SHA-256 会导致签名校验失败。CC_MD5 在 iOS 13 被标废弃，
+/// 所以这里关掉废弃诊断，而不是改用别的算法。
 enum Digest {
     static func md5Hex(_ data: Data) -> String {
         var digest = [UInt8](repeating: 0, count: Int(CC_MD5_DIGEST_LENGTH))

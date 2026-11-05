@@ -189,12 +189,10 @@ final class PlayerViewModel: ObservableObject {
                 self.updateNowPlaying()
             }
         }
-        if let av = engine as? AVPlayerEngine {
-            av.onEnded = { [weak self] in
-                Task { @MainActor in self?.next() }
-            }
-        }
-        self.engine = engine
+        // engine 的静态类型本来就是 AVPlayerEngine，直接赋值，不必再转换
+        engine.onEnded = { [weak self] in
+            Task { @MainActor in self?.next() }
+        }        self.engine = engine
         return engine
     }
 
