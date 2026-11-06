@@ -464,28 +464,88 @@ extension String {
 
     /// 书源的简介字段经常是 HTML / `<useweb>` 富文本面板（给阅读界面渲染用的）。
     /// 原生列表直接显示会看到一堆标签，这里剥成纯文本。
+    ///
+    /// 番茄的源更极端：intro 规则返回 30KB 的完整面板（含 CSS、音色选择器、
+    /// 收藏按钮……），真正的简介藏在 `<div class="intro" id=intro>…</div>` 里。
+    /// 所以先找语义容器，找不到再退回整体剥标签。
     var plainTextFromMarkup: String? {
-        var t = self
-        if t.contains("<") {
-            // 去掉 script/style 段
-            t = t.replacingOccurrences(of: "<script[^>]*>[\\s\\S]*?</script>",
-                                       with: "", options: [.regularExpression, .caseInsensitive])
-            t = t.replacingOccurrences(of: "<style[^>]*>[\\s\\S]*?</style>",
-                                       with: "", options: [.regularExpression, .caseInsensitive])
-            // 块级标签转换行
-            t = t.replacingOccurrences(of: "<(br|/p|/div|/li)[^>]*>",
-                                       with: "\n", options: [.regularExpression, .caseInsensitive])
-            // 其余标签全去掉
-            t = t.replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
-            // 实体
-            let entities = ["&nbsp;": " ", "&amp;": "&", "&lt;": "<", "&gt;": ">",
-                            "&quot;": "\"", "&#39;": "'", "&hellip;": "…", "&mdash;": "—"]
-            for (k, v) in entities { t = t.replacingOccurrences(of: k, with: v) }
+        var src = self
+
+        // 1) 优先从「简介容器」里取
+        let containerPatterns = [
+            "<div[^>]*id=[\"']?intro[\"']?[^>]*>([\\s\\S]*?)</div>",
+            "<div[^>]*class=[\"'][^\"']*\\bintro\\b[^\"']*[\"'][^>]*>([\\s\\S]*?)</div>",
+            "<div[^>]*class=[\"'][^\"']*\\babstract\\b[^\"']*[\"'][^>]*>([\\s\\S]*?)</div>",
+        ]
+        for pattern in containerPatterns {
+            if let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]),
+               let match = regex.firstMatch(in: src, options: [],
+                                            range: NSRange(src.startIndex..<src.endIndex, in: src)),
+               match.numberOfRanges > 1,
+               let range = Range(match.range(at: 1), in: src) {
+                let inner = String(src[range])
+                let cleaned = Self.stripTags(inner)
+                if cleaned.count >= 20 { return cleaned }   // 太短的多半是标题占位
+            }
         }
-        // 压缩空白
-        t = t.replacingOccurrences(of: "[ \\t]+", with: " ", options: .regularExpression)
-        t = t.replacingOccurrences(of: "\\n{3,}", with: "\n\n", options: .regularExpression)
-        t = t.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // 2) 整体剥标签
+        if src.contains("<") {
+            let cleaned = Self.stripTags(src)
+            // 面板类 HTML 剥完会剩下一堆控件文案（「订阅收藏 音色 共 6 个」），
+            // 这种宁可返回 nil 让调用方隐藏该区块，也不显示垃圾。
+            if Self.looksLikeChrome(cleaned) { return nil }
+            return cleaned.isEmpty ? nil : cleaned
+        }
+
+        let t = src.trimmingCharacters(in: .whitespacesAndNewlines)
         return t.isEmpty ? nil : t
+    }
+
+    private static func stripTags(_ text: String) -> String {
+        var t = text
+        // 去掉 script/style 整段
+        for tag in ["script", "style", "svg", "button"] {
+            if let re = try? NSRegularExpression(
+                pattern: "<\(tag)[^>]*>[\\s\\S]*?</\(tag)>", options: [.caseInsensitive]) {
+                t = re.stringByReplacingMatches(
+                    in: t, range: NSRange(t.startIndex..<t.endIndex, in: t), withTemplate: "")
+            }
+        }
+        // 块级标签转换行
+        if let re = try? NSRegularExpression(
+            pattern: "<(br|/p|/div|/li|/h[1-6])[^>]*>", options: [.caseInsensitive]) {
+            t = re.stringByReplacingMatches(
+                in: t, range: NSRange(t.startIndex..<t.endIndex, in: t), withTemplate: "\n")
+        }
+        // 其余标签去掉
+        if let re = try? NSRegularExpression(pattern: "<[^>]+>") {
+            t = re.stringByReplacingMatches(
+                in: t, range: NSRange(t.startIndex..<t.endIndex, in: t), withTemplate: "")
+        }
+        // 实体
+        let entities = ["&nbsp;": " ", "&amp;": "&", "&lt;": "<", "&gt;": ">",
+                        "&quot;": "\"", "&#39;": "'", "&hellip;": "…", "&mdash;": "—",
+                        "&ldquo;": "“", "&rdquo;": "”", "&middot;": "·"]
+        for (k, v) in entities { t = t.replacingOccurrences(of: k, with: v) }
+        // 压缩空白
+        if let re = try? NSRegularExpression(pattern: "[ \\t]+") {
+            t = re.stringByReplacingMatches(
+                in: t, range: NSRange(t.startIndex..<t.endIndex, in: t), withTemplate: " ")
+        }
+        if let re = try? NSRegularExpression(pattern: "\\n{3,}") {
+            t = re.stringByReplacingMatches(
+                in: t, range: NSRange(t.startIndex..<t.endIndex, in: t), withTemplate: "\n\n")
+        }
+        return t.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// 判断剥完标签后剩下的是不是界面控件文案而不是正文。
+    /// 面板类 HTML 剥完会长这样：「订阅收藏 音色 共 6 个 系统优选：男声 …」
+    private static func looksLikeChrome(_ text: String) -> Bool {
+        let markers = ["订阅收藏", "音色", "系统优选", "展开 ▾", "章节数", "共 ", "人在听", "可朗读"]
+        let hits = markers.filter { text.contains($0) }.count
+        // 命中 3 个以上控件词，且整体很短 → 认定是面板垃圾
+        return hits >= 3 && text.count < 600
     }
 }

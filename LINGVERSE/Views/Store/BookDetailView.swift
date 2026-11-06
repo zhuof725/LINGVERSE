@@ -52,8 +52,12 @@ struct BookDetailView: View {
                 contentView
             }
         }
-        .navigationTitle(detail?.name ?? result.name)
+        // 顶部是整幅封面，导航栏不能占位：改成透明背景 + 只留返回箭头。
+        // 书名已经压在图上，标题栏再显示一遍就是重复信息，而且会盖住图。
+        .navigationTitle("")
         .navigationBarTitleDisplayMode(.inline)
+        .toolbarBackground(.hidden, for: .navigationBar)
+        .toolbarColorScheme(.dark, for: .navigationBar)
         .toolbar(.hidden, for: .tabBar)
         .task { load() }
         .alert("播放失败", isPresented: Binding(
@@ -106,66 +110,95 @@ struct BookDetailView: View {
 
     // MARK: - 顶部大图
 
+    /// 顶部大图区。
+    ///
+    /// 参考布局：一张封面**整幅**铺满（不模糊、不裁成小方块），
+    /// 底部压一层深色渐变，标题/作者/书源直接叠在图上。
+    /// 高度取屏高的 52%，让它压得住整页 —— 太矮就变成「一张图 + 一堆文字」的普通列表。
     private var heroHeader: some View {
-        ZStack(alignment: .bottom) {
-            // 背景：同一张封面放大 + 模糊 + 压暗，铺满顶部
-            AsyncImage(url: coverURL) { image in
-                image.resizable().aspectRatio(contentMode: .fill)
-            } placeholder: {
-                Color(white: 0.16)
-            }
-            .frame(height: 360)
-            .frame(maxWidth: .infinity)
-            .clipped()
-            .blur(radius: 28)
-            .overlay(
+        GeometryReader { geo in
+            let h = geo.size.height
+            ZStack(alignment: .bottomLeading) {
+                // 整幅封面
+                AsyncImage(url: coverURL) { phase in
+                    switch phase {
+                    case .success(let image):
+                        image.resizable()
+                            .aspectRatio(contentMode: .fill)
+                            .frame(width: geo.size.width, height: h)
+                            .clipped()
+                    case .failure:
+                        fallbackCover(width: geo.size.width, height: h)
+                    default:
+                        Rectangle()
+                            .fill(Color(white: 0.14))
+                            .overlay(ProgressView().tint(.white.opacity(0.6)))
+                    }
+                }
+
+                // 底部渐变：保证白字可读，顶部留一点暗角防止状态栏看不清
                 LinearGradient(
-                    colors: [.black.opacity(0.25), .black.opacity(0.55), .black.opacity(0.92)],
+                    stops: [
+                        .init(color: .black.opacity(0.55), location: 0.0),
+                        .init(color: .black.opacity(0.05), location: 0.28),
+                        .init(color: .black.opacity(0.55), location: 0.62),
+                        .init(color: .black.opacity(0.95), location: 1.0),
+                    ],
                     startPoint: .top, endPoint: .bottom
                 )
-            )
 
-            HStack(alignment: .bottom, spacing: 14) {
-                // 前景：清晰封面
-                AsyncImage(url: coverURL) { image in
-                    image.resizable().aspectRatio(contentMode: .fill)
-                } placeholder: {
-                    RoundedRectangle(cornerRadius: 10)
-                        .fill(Color.white.opacity(0.12))
-                        .overlay(Image(systemName: "book.closed")
-                            .foregroundStyle(.white.opacity(0.6)))
-                }
-                .frame(width: 104, height: 140)
-                .clipShape(RoundedRectangle(cornerRadius: 10))
-                .shadow(color: .black.opacity(0.4), radius: 10, y: 4)
-
-                VStack(alignment: .leading, spacing: 6) {
+                // 标题 / 作者 / 书源
+                VStack(alignment: .leading, spacing: 8) {
                     Text(detail?.name ?? result.name)
-                        .font(.title3.weight(.bold))
+                        .font(.system(size: 26, weight: .bold))
                         .foregroundStyle(.white)
                         .lineLimit(2)
                         .fixedSize(horizontal: false, vertical: true)
+                        .shadow(color: .black.opacity(0.4), radius: 4, y: 1)
 
                     HStack(spacing: 6) {
-                        Image(systemName: "person.circle.fill")
-                            .font(.caption)
+                        Image(systemName: "person.crop.circle.fill")
+                            .font(.system(size: 15))
                         Text(authorText)
-                            .font(.subheadline)
+                            .font(.callout)
                             .lineLimit(1)
                     }
-                    .foregroundStyle(.white.opacity(0.8))
+                    .foregroundStyle(.white.opacity(0.88))
 
-                    Text(source?.bookSourceName ?? result.sourceName)
-                        .font(.caption2)
-                        .foregroundStyle(.white.opacity(0.55))
-                        .lineLimit(1)
+                    HStack(spacing: 5) {
+                        Image(systemName: "antenna.radiowaves.left.and.right")
+                            .font(.system(size: 10))
+                        Text(source?.bookSourceName ?? result.sourceName)
+                            .font(.caption2)
+                            .lineLimit(1)
+                    }
+                    .foregroundStyle(.white.opacity(0.6))
                 }
-                Spacer(minLength: 0)
+                .padding(.horizontal, 20)
+                .padding(.bottom, 22)
             }
-            .padding(.horizontal, 18)
-            .padding(.bottom, 20)
         }
-        .frame(height: 360)
+        .frame(height: heroHeight)
+        .frame(maxWidth: .infinity)
+    }
+
+    /// 顶部高度。用屏高的 52% 而不是固定值：
+    /// 小屏（SE）和大屏（Pro Max）都能压住版面，不会出现「图很矮、下面一堆空白」。
+    /// UIScreen.main 在 iOS 17 已 deprecated，但在 iOS 17 上仍然可用且无警告等级问题。
+    private var heroHeight: CGFloat {
+        let screen = UIScreen.main.bounds.height
+        return min(max(screen * 0.52, 340), 470)
+    }
+
+    private func fallbackCover(width: CGFloat, height: CGFloat) -> some View {
+        ZStack {
+            LinearGradient(colors: [Color(white: 0.22), Color(white: 0.10)],
+                           startPoint: .topLeading, endPoint: .bottomTrailing)
+            Image(systemName: "book.closed.fill")
+                .font(.system(size: 56))
+                .foregroundStyle(.white.opacity(0.25))
+        }
+        .frame(width: width, height: height)
     }
 
     private var coverURL: URL? {
@@ -224,17 +257,18 @@ struct BookDetailView: View {
     }
 
     private func statCell(value: String, label: String, highlight: Bool = false) -> some View {
-        VStack(spacing: 3) {
+        VStack(spacing: 4) {
             Text(value)
-                .font(.system(size: 19, weight: .semibold, design: .rounded))
+                .font(.system(size: 22, weight: .semibold, design: .rounded))
                 .foregroundStyle(highlight ? Color.accentColor : .primary)
                 .lineLimit(1)
-                .minimumScaleFactor(0.7)
+                .minimumScaleFactor(0.6)
             Text(label)
                 .font(.caption2)
                 .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity)
+        .padding(.vertical, 2)
     }
 
     // MARK: - 标签 + 简介
@@ -452,15 +486,11 @@ struct BookDetailView: View {
                         .fixedSize(horizontal: false, vertical: true)
 
                     HStack(spacing: 10) {
-                        if let dur = chapterDuration(chapter) {
-                            Label(dur, systemImage: "clock")
+                        // updateTime 里已经含「2043 字 · ≈7:15」，只渲染一次
+                        if let ut = chapter.updateTime, !ut.isEmpty {
+                            Label(ut, systemImage: "clock")
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
-                        }
-                        if let ut = chapter.updateTime, !ut.isEmpty {
-                            Text(ut)
-                                .font(.caption2)
-                                .foregroundStyle(.tertiary)
                         }
                     }
                 }
