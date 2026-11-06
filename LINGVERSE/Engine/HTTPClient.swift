@@ -68,6 +68,11 @@ final class HTTPClient {
             let text = Self.decode(data, response: response)
             result = text
             Diagnostics.shared.add("http", "\(method) \(target.host ?? "") → \(status) \(text.count) 字符")
+            // 响应异常短时把内容也记下来：签名失败/风控通常返回一小段错误 JSON，
+            // 光看长度无法判断，必须看到内容。
+            if text.count < 400 {
+                Diagnostics.shared.add("http", "短响应内容: \(text.prefix(380))")
+            }
         }
         task.resume()
 
