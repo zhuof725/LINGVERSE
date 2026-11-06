@@ -199,7 +199,7 @@ struct BookDetailView: View {
             // 图片作为背景层：高度 h + 下拉距离，底部对齐，
             // 多出来的部分向上溢出（不会撑大 ZStack，标题位置不受影响）。
             .background(alignment: .bottom) {
-                coverImage
+                coverImage()
                     .frame(width: geo.size.width, height: h + extra)
             }
         }
