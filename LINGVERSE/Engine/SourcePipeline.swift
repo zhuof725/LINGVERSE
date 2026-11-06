@@ -131,23 +131,37 @@ final class SourcePipeline {
     func bookInfo(_ bookURL: String, source: BookSource, hint: SearchResult? = nil) throws -> BookDetail {
         let rule = source.ruleBookInfo
         var ctx = RuleContext(baseURL: bookURL)
-        ctx.book = ["name": hint?.name ?? ""]
+        ctx.book = ["name": hint?.name ?? "", "bookUrl": bookURL, "author": hint?.author ?? ""]
         ctx.jsLib = source.jsLib ?? ""
         ctx.vars["__sourceUrl"] = source.bookSourceUrl
         ctx.vars["__sourceName"] = source.bookSourceName
         ctx.vars["__sourceKey"] = source.bookSourceUrl
 
-        // init 规则：有些源靠它把 bookUrl 换成真实详情接口（常带签名头）
+        // init 规则：有些源靠它抓真实详情接口（常带签名头），返回值就是详情内容
         var detailURL = bookURL
         var detailSpec: RequestSpec?
+
+        // init 规则：它自己抓详情接口，返回的是**详情内容本身**（通常是一段 JSON），
+        // 后续 name/author 等规则都在这个返回值上求值 —— 不是「返回一个 URL」。
+        // 之前把它当成「置换 detailURL」用，于是 name/author 拿到的是空，
+        // 详情页只剩下标题，表现为「加载失败」。
+        var initBody: String?
         if let initRule = rule?.`init`, !initRule.isEmpty {
-            ctx.body = HTTPClient.shared.get(bookURL) ?? ""
-            detailSpec = try? expandRequest(initRule, ctx: ctx, json: RuleEngine.parseJSON(ctx.body))
-            if let spec = detailSpec { detailURL = spec.url }
+            let seed = HTTPClient.shared.get(bookURL) ?? ""
+            var initCtx = ctx
+            initCtx.body = seed
+            let produced = RuleEngine.eval(initRule, initCtx, json: RuleEngine.parseJSON(seed)).string
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !produced.isEmpty, produced != "{}" {
+                initBody = produced
+            }
+            Diagnostics.shared.add("bookInfo", "init 产出 \(produced.count) 字符")
         }
 
         let body: String
-        if let spec = detailSpec {
+        if let initBody {
+            body = initBody
+        } else if let spec = detailSpec {
             body = HTTPClient.shared.request(spec.url, method: spec.method, body: spec.body,
                                              headers: spec.headers, timeout: 25) ?? ""
         } else {
@@ -167,13 +181,13 @@ final class SourcePipeline {
             bookUrl: bookURL,
             name: name,
             author: field(rule?.author).nilIfEmpty ?? hint?.author ?? "",
-            intro: field(rule?.intro).nilIfEmpty ?? hint?.intro,
+            intro: field(rule?.intro).plainTextFromMarkup ?? hint?.intro,
             kind: field(rule?.kind).nilIfEmpty ?? hint?.kind,
             coverUrl: absolute(field(rule?.coverUrl), base: detailURL),
             lastChapter: field(rule?.lastChapter).nilIfEmpty ?? hint?.lastChapter,
             wordCount: field(rule?.wordCount).nilIfEmpty
         )
-        ctx.book = ["name": detail.name, "author": detail.author]
+        ctx.book = ["name": detail.name, "author": detail.author, "bookUrl": detail.bookUrl]
 
         // 目录地址：优先 tocUrl 规则，否则就当 bookUrl 本身是目录页。
         // tocUrl 规则往往产出「URL + 签名头」的 POST 请求，光存 URL 会丢掉 headers，
@@ -197,7 +211,7 @@ final class SourcePipeline {
         guard let rule = source.ruleToc else { throw SourceError.missingRule("ruleToc") }
         let tocURL = detail.tocUrl ?? detail.bookUrl
         var ctx = RuleContext(baseURL: tocURL)
-        ctx.book = ["name": detail.name, "author": detail.author]
+        ctx.book = ["name": detail.name, "author": detail.author, "bookUrl": detail.bookUrl]
         ctx.jsLib = source.jsLib ?? ""
         ctx.vars["__sourceUrl"] = source.bookSourceUrl
         ctx.vars["__sourceName"] = source.bookSourceName
@@ -264,24 +278,25 @@ final class SourcePipeline {
         }
 
         var ctx = RuleContext(baseURL: chapterURL)
-        ctx.book = ["name": detail.name, "author": detail.author]
+        // 规则里会读 book.bookUrl 来提取 book_id，只给 name 不够
+        ctx.book = ["name": detail.name, "author": detail.author, "bookUrl": detail.bookUrl]
         ctx.chapter = ["title": chapter.title, "index": String(chapter.index), "url": chapterURL]
         ctx.jsLib = source.jsLib ?? ""
         ctx.vars["__sourceUrl"] = source.bookSourceUrl
         ctx.vars["__sourceName"] = source.bookSourceName
         ctx.vars["__sourceKey"] = source.bookSourceUrl
 
-        // 章节地址可能是「URL + 签名头」，也可能是普通的页面 URL。
-        // 先用章节地址抓一次，拿不到再退回纯 GET。
-        var body: String?
-        if let spec = try? RequestSpec.parse(chapterURL, base: chapterURL) {
-            body = HTTPClient.shared.request(spec.url, method: spec.method, body: spec.body,
-                                             headers: spec.headers, timeout: 25)
+        // 章节地址可能只是「参数载体」（番茄的 mcs.zijieapi.com/list?item_id=... 根本
+        // 不是给人看的页面），也可能本身就是音频直链。
+        // 所以：能抓就抓，抓不到也继续跑规则 —— 规则自己会发请求。
+        var body = ""
+        if AudioURL.isDirect(chapterURL) {
+            return [chapterURL]
         }
-        if body == nil { body = HTTPClient.shared.get(chapterURL) }
-        guard let body else {
-            if AudioURL.isDirect(chapterURL) { return [chapterURL] }
-            throw SourceError.requestFailed(chapterURL)
+        if let spec = try? RequestSpec.parse(chapterURL, base: chapterURL),
+           let fetched = HTTPClient.shared.request(spec.url, method: spec.method, body: spec.body,
+                                                   headers: spec.headers, timeout: 20) {
+            body = fetched
         }
         ctx.body = body
 
@@ -366,6 +381,33 @@ enum SourceError: LocalizedError {
 extension String {
     var nilIfEmpty: String? {
         let t = trimmingCharacters(in: .whitespacesAndNewlines)
+        return t.isEmpty ? nil : t
+    }
+
+    /// 书源的简介字段经常是 HTML / `<useweb>` 富文本面板（给阅读界面渲染用的）。
+    /// 原生列表直接显示会看到一堆标签，这里剥成纯文本。
+    var plainTextFromMarkup: String? {
+        var t = self
+        if t.contains("<") {
+            // 去掉 script/style 段
+            t = t.replacingOccurrences(of: "<script[^>]*>[\\s\\S]*?</script>",
+                                       with: "", options: [.regularExpression, .caseInsensitive])
+            t = t.replacingOccurrences(of: "<style[^>]*>[\\s\\S]*?</style>",
+                                       with: "", options: [.regularExpression, .caseInsensitive])
+            // 块级标签转换行
+            t = t.replacingOccurrences(of: "<(br|/p|/div|/li)[^>]*>",
+                                       with: "\n", options: [.regularExpression, .caseInsensitive])
+            // 其余标签全去掉
+            t = t.replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
+            // 实体
+            let entities = ["&nbsp;": " ", "&amp;": "&", "&lt;": "<", "&gt;": ">",
+                            "&quot;": "\"", "&#39;": "'", "&hellip;": "…", "&mdash;": "—"]
+            for (k, v) in entities { t = t.replacingOccurrences(of: k, with: v) }
+        }
+        // 压缩空白
+        t = t.replacingOccurrences(of: "[ \\t]+", with: " ", options: .regularExpression)
+        t = t.replacingOccurrences(of: "\\n{3,}", with: "\n\n", options: .regularExpression)
+        t = t.trimmingCharacters(in: .whitespacesAndNewlines)
         return t.isEmpty ? nil : t
     }
 }

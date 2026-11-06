@@ -84,8 +84,18 @@ final class JSRunner {
         let request: @convention(block) (String, String) -> String = { url, optsJSON in
             let opts = (try? JSONSerialization.jsonObject(with: Data(optsJSON.utf8))) as? [String: Any] ?? [:]
             let method = (opts["method"] as? String)?.uppercased() ?? "POST"
-            let body = opts["body"] as? String
-            let headers = opts["headers"] as? [String: String] ?? [:]
+            let body: String?
+            if let s = opts["body"] as? String { body = s }
+            else if let b = opts["body"] { body = String(describing: b) }
+            else { body = nil }
+            // headers 可能是 [String:String]，也可能值里有数字；宽松转换，别整批丢掉
+            var headers: [String: String] = [:]
+            if let raw = opts["headers"] as? [String: Any] {
+                for (k, v) in raw {
+                    if let s = v as? String { headers[k] = s }
+                    else if !(v is NSNull) { headers[k] = String(describing: v) }
+                }
+            }
             return HTTPClient.shared.request(url, method: method, body: body, headers: headers) ?? ""
         }
         let base64Encode: @convention(block) (String) -> String = { s in
@@ -110,6 +120,20 @@ final class JSRunner {
             return String(data: d, encoding: .utf8) ?? ""
         }
 
+        // Cookie 存根。真实书源的 cookie.getKey 用于带登录态；
+        // 未登录时返回空串即可，但要存在，否则脚本抛 ReferenceError。
+        let cookieGet: @convention(block) (String, String) -> String = { url, key in
+            CookieStore.shared.value(url: url, key: key)
+        }
+        let cookieSet: @convention(block) (String, String) -> Bool = { url, value in
+            CookieStore.shared.set(url: url, raw: value)
+            return true
+        }
+        let cookieRemove: @convention(block) (String) -> Bool = { url in
+            CookieStore.shared.remove(url: url)
+            return true
+        }
+
         context.setObject(ajax, forKeyedSubscript: "__ajax" as NSString)
         context.setObject(ajaxTimeout, forKeyedSubscript: "__ajaxTimeout" as NSString)
         context.setObject(ajaxAll, forKeyedSubscript: "__ajaxAll" as NSString)
@@ -120,6 +144,9 @@ final class JSRunner {
         context.setObject(sha256, forKeyedSubscript: "__sha256" as NSString)
         context.setObject(log, forKeyedSubscript: "__log" as NSString)
         context.setObject(decodeB64, forKeyedSubscript: "__decodeB64" as NSString)
+        context.setObject(cookieGet, forKeyedSubscript: "__cookieGet" as NSString)
+        context.setObject(cookieSet, forKeyedSubscript: "__cookieSet" as NSString)
+        context.setObject(cookieRemove, forKeyedSubscript: "__cookieRemove" as NSString)
 
         // 规则变量：把原生侧的表序列化进去，求值结束后再回收。
         // 这样 java.put 在 bookInfo 里写的 book_id，toc 规则里才 get 得到。
@@ -251,26 +278,65 @@ final class JSRunner {
     /// 比静默返回空串更容易定位。
     private static let prelude = """
     var java = {
+      // Legado 的 java.ajax / connect / get 返回 StrResponse，不是字符串。
+      // 真实书源写 java.get(url, map).body() —— 返回纯字符串会让 .body() 抛
+      // TypeError，被书源自己的 try/catch 吞掉，界面上只剩「请求失败」。
       ajax: function(u, opt) {
-        if (typeof opt === 'number') return __ajaxTimeout(String(u), opt);
-        if (opt && typeof opt === 'object') return __request(String(u), JSON.stringify(opt));
-        return __ajax(String(u));
+        var text, code = 0;
+        if (typeof opt === 'number') {
+          text = __ajaxTimeout(String(u), opt);
+        } else if (opt && typeof opt === 'object') {
+          text = __request(String(u), JSON.stringify(opt));
+        } else {
+          text = __ajax(String(u));
+        }
+        return __wrapResponse(text);
       },
-      ajaxAll: function(list) { return __ajaxAll(list); },
-      connect: function(u) { return __ajax(String(u)); },
-      connectNative: function(u) { return __ajax(String(u)); },
+      ajaxAll: function(list) {
+        var raw = __ajaxAll(list) || [];
+        var out = [];
+        for (var i = 0; i < raw.length; i++) out.push(__wrapResponse(raw[i]));
+        return out;
+      },
+      connect: function(u, headers) {
+        if (headers) {
+          var h = (typeof headers === 'string') ? JSON.parse(headers) : headers;
+          return __wrapResponse(__request(String(u), JSON.stringify({ method: 'GET', headers: h })));
+        }
+        return __wrapResponse(__ajax(String(u)));
+      },
+      connectNative: function(u) { return __wrapResponse(__ajax(String(u))); },
       put: function(k, v) {
         __ruleVars[String(k)] = String(v);
         __putRuleVar(String(k), String(v));
         return '';
       },
-      get: function(k) { return (__ruleVars[String(k)] !== undefined) ? __ruleVars[String(k)] : ''; },
+      // java.get 有两个重载，Legado 靠参数形态区分：
+      //   get(url, headers)  取网页，返回 StrResponse
+      //   get(key)           读 java.put 存的变量，返回字符串
+      get: function(a, b) {
+        var isURL = /^https?:/i.test(String(a));
+        if (typeof b === 'undefined' && !isURL) {
+          return (__ruleVars[String(a)] !== undefined) ? __ruleVars[String(a)] : '';
+        }
+        var opt = { method: 'GET' };
+        if (b) {
+          opt.headers = (typeof b === 'string') ? JSON.parse(b) : b;
+          // HashMap 实例在 JS 侧已展开成普通对象
+          if (opt.headers && opt.headers.__map) opt.headers = opt.headers.__map;
+        }
+        return __wrapResponse(__request(String(a), JSON.stringify(opt)));
+      },
       post: function(u, body, headers) {
         var opt = {method: 'POST', body: String(body === undefined ? '' : body)};
-        if (headers) opt.headers = headers;
-        return __request(String(u), JSON.stringify(opt));
+        if (headers) {
+          var h = (typeof headers === 'string') ? JSON.parse(headers) : headers;
+          if (h && h.__map) h = h.__map;
+          opt.headers = h;
+        }
+        return __wrapResponse(__request(String(u), JSON.stringify(opt)));
       },
-      head: function(u) { return __request(String(u), '{"method":"HEAD"}'); },
+      head: function(u) { return __wrapResponse(__request(String(u), '{"method":"HEAD"}')); },
       base64Encode: function(s) { return __base64Encode(String(s)); },
       base64Decode: function(s) { return __base64Decode(String(s)); },
       md5Encode: function(s) { return __md5(String(s)); },
@@ -329,12 +395,68 @@ final class JSRunner {
     // java.put / java.get 共用的规则变量表。legado 用它跨规则传 book_id 这类值。
     if (typeof __ruleVars === 'undefined') { var __ruleVars = {}; }
 
+    // Legado 的 StrResponse：书源写 resp.body() / resp.code()。
+    // 包一层，让 java.* 的返回值既能当字符串（String(r)）又能调 .body()。
+    function __wrapResponse(text) {
+      var t = (text === undefined || text === null) ? '' : String(text);
+      return {
+        body: function() { return t; },
+        code: function() { return 200; },
+        headers: function() { return {}; },
+        url: function() { return ''; },
+        isSuccessful: function() { return true; },
+        string: function() { return t; },
+        toString: function() { return t; },
+        valueOf: function() { return t; }
+      };
+    }
+
+    // Packages.java.util.HashMap：书源用它构造请求头，然后传给 java.get。
+    // 只要能被 for..in 遍历、支持 put 就够了。
+    var Packages = {
+      java: {
+        util: {
+          HashMap: function() {
+            var m = {};
+            return {
+              __map: m,
+              put: function(k, v) { m[String(k)] = String(v); return v; },
+              get: function(k) { return (m[String(k)] !== undefined) ? m[String(k)] : null; },
+              containsKey: function(k) { return Object.prototype.hasOwnProperty.call(m, String(k)); },
+              keySet: function() { return Object.keys(m); },
+              size: function() { return Object.keys(m).length; }
+            };
+          },
+          ArrayList: function() { return []; }
+        },
+        lang: { String: String, Integer: Number }
+      }
+    };
+
+    // cache.*：书源用来缓存详情/目录，LINGVERSE 侧用内存表（进程内有效）
+    var __cacheMap = {};
+    var cache = {
+      putMemory: function(k, v) { __cacheMap[String(k)] = String(v); return ''; },
+      getFromMemory: function(k) { return (__cacheMap[String(k)] !== undefined) ? __cacheMap[String(k)] : ''; },
+      deleteMemory: function(k) { delete __cacheMap[String(k)]; return ''; },
+      put: function(k, v) { __cacheMap[String(k)] = String(v); return ''; },
+      get: function(k) { return (__cacheMap[String(k)] !== undefined) ? __cacheMap[String(k)] : ''; },
+      delete: function(k) { delete __cacheMap[String(k)]; return ''; }
+    };
+
+    // cookie.*：真实书源用 getKey(url, name) 取单个 cookie、getCookie(url) 取整条。
+    // 这些只影响需要登录的源；未登录时返回空串是正确行为。
     var cookie = {
-      get: function() { return ''; },
-      set: function() { return true; },
-      remove: function() { return true; },
-      replace: function() { return true; },
-      getKey: function() { return ''; },
+      getKey: function(url, key) { return __cookieGet(String(url), String(key)); },
+      getCookie: function(url) { return __cookieGet(String(url), ''); },
+      setCookie: function(url, v) { return __cookieSet(String(url), String(v)); },
+      removeCookie: function(url) { return __cookieRemove(String(url)); },
+      replaceCookie: function(url, v) { return __cookieSet(String(url), String(v)); },
+      get: function() { return __cookieGet('', ''); },
+      set: function(url, v) { return __cookieSet(String(url), String(v)); },
+      remove: function(url) { return __cookieRemove(String(url)); },
+      replace: function(url, v) { return __cookieSet(String(url), String(v)); },
+      getKey_: function() { return ''; },
       toMap: function() { return []; },
       fromMap: function() { return ''; }
     };
