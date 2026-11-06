@@ -105,10 +105,13 @@ struct BookDetailView: View {
     private static let heroDivider = Color.white.opacity(0.14)
 
     private var contentView: some View {
-        ScrollView {
+        // 安全区顶高度在 GeometryReader 里可能因为 ignoresSafeArea 变成 0，
+        // 所以从窗口读一次固定值。
+        let topInset = (UIApplication.shared.connectedScenes.first as? UIWindowScene)?
+            .windows.first?.safeAreaInsets.top ?? 0
+        return ScrollView {
             VStack(spacing: 0) {
                 heroHeader(pull: pullOffset)
-                    // 探针挂在 hero 上，不占布局高度，也不会在顶部留缝。
                     .background(
                         ScrollOffsetReader { offset in
                             let pull = max(-offset, 0)
@@ -124,12 +127,15 @@ struct BookDetailView: View {
                 tabBar
                 tabContent
             }
+            // 负 padding 把内容顶到屏幕物理顶端。
+            // ScrollView 默认从安全区下方开始排内容，
+            // 只加 ignoresSafeArea 影响的是背景而不是内容位置 ——
+            // 用户截图里顶部那一大块白就是这么来的。
+            .padding(.top, -topInset)
         }
-        // 关键：把安全区顶也吃掉，内容从屏幕物理顶端开始排。
-        // 少了这个，ScrollView 内容会从状态栏下面开始，顶部留出一条白。
-        .ignoresSafeArea(edges: [.top, .horizontal])
         .safeAreaInset(edge: .bottom, spacing: 0) { bottomBar }
         .scrollDismissesKeyboard(.immediately)
+        .ignoresSafeArea(edges: [.top, .horizontal])
     }
 
     // MARK: - 顶部大图
@@ -142,41 +148,13 @@ struct BookDetailView: View {
     /// `pull` 是下拉回弹的距离（ScrollView 内容顶部超出屏幕的高度）。
     /// 大于 0 时把图片高度加上这段，图片就跟着手指一起拉长，不会露出背景。
     private func heroHeader(pull: CGFloat) -> some View {
-        // 下拉时图片会向上溢出这个容器（底边固定，顶边向上长）。
-        // 容器本身高度不变，所以不会推动下方内容；
-        // 溢出部分靠父级不裁剪来显示。
         let extra = max(pull, 0)
         return GeometryReader { geo in
             let h = geo.size.height
+            // 注意结构：图片放在 background 里，不参与 ZStack 的尺寸计算。
+            // 如果图片直接放进 ZStack，它 h+extra 的高度会把 ZStack 撑大，
+            // 标题就被推到可见区之外 —— 用户截图里标题消失就是这个原因。
             ZStack(alignment: .bottomLeading) {
-                // 整幅封面。
-                //
-                // 关键：用 .resizable().scaledToFill() 而不是 .aspectRatio(contentMode: .fill)。
-                // 后者一旦外面套了固定宽高的 .frame，aspectRatio 就失效，
-                // 图片会被直接拉伸填满 —— 用户截图里封面上下分裂成两截、
-                // 人物被拉变形，就是这个原因。
-                // scaledToFill 会保持比例放大再裁切，配合 .clipped() 才是正确行为。
-                AsyncImage(url: coverURL) { phase in
-                    switch phase {
-                    case .success(let image):
-                        image.resizable()
-                            .scaledToFill()
-                            .frame(width: geo.size.width, height: h + extra)
-                            .clipped()
-                    case .failure:
-                        fallbackCover(width: geo.size.width, height: h + extra)
-                    default:
-                        Rectangle()
-                            .fill(Color(white: 0.14))
-                            .overlay(ProgressView().tint(.white.opacity(0.6)))
-                    }
-                }
-                // 图片高度 = 容器高度 + 下拉距离，alignment: .bottom 让底边钉住，
-                // 多出来的高度自然向上溢出（GeometryReader 不裁剪子视图）。
-                // 不要再加 offset —— 那会把底边也一起推上去，底部露缝。
-                .frame(height: h + extra, alignment: .bottom)
-
-                // 底部渐变：保证白字可读，顶部留一点暗角防止状态栏看不清
                 LinearGradient(
                     stops: [
                         .init(color: .black.opacity(0.55), location: 0.0),
@@ -188,7 +166,6 @@ struct BookDetailView: View {
                 )
                 .allowsHitTesting(false)
 
-                // 标题 / 作者 / 书源。始终贴在图片底部，拉长时跟着下移
                 VStack(alignment: .leading, spacing: 8) {
                     Text(detail?.name ?? result.name)
                         .font(.system(size: 26, weight: .bold))
@@ -218,9 +195,43 @@ struct BookDetailView: View {
                 .padding(.horizontal, 20)
                 .padding(.bottom, 22)
             }
+            .frame(width: geo.size.width, height: h, alignment: .bottomLeading)
+            // 图片作为背景层：高度 h + 下拉距离，底部对齐，
+            // 多出来的部分向上溢出（不会撑大 ZStack，标题位置不受影响）。
+            .background(alignment: .bottom) {
+                coverImage
+                    .frame(width: geo.size.width, height: h + extra)
+            }
         }
         .frame(height: heroHeight)
         .frame(maxWidth: .infinity)
+    }
+
+    /// 封面图。用 scaledToFill 保持比例裁切，
+    /// 不能用 .aspectRatio(contentMode: .fill) —— 外面套固定宽高 frame 时它会失效，
+    /// 图片被直接拉伸变形。
+    @ViewBuilder
+    private func coverImage() -> some View {
+        AsyncImage(url: coverURL) { phase in
+            switch phase {
+            case .success(let image):
+                image.resizable()
+                    .scaledToFill()
+                    .clipped()
+            case .failure:
+                ZStack {
+                    LinearGradient(colors: [Color(white: 0.22), Color(white: 0.10)],
+                                   startPoint: .topLeading, endPoint: .bottomTrailing)
+                    Image(systemName: "book.closed.fill")
+                        .font(.system(size: 56))
+                        .foregroundStyle(.white.opacity(0.25))
+                }
+            default:
+                Rectangle()
+                    .fill(Color(white: 0.14))
+                    .overlay(ProgressView().tint(.white.opacity(0.6)))
+            }
+        }
     }
 
     /// 顶部高度。用屏高的 52% 而不是固定值：
@@ -229,17 +240,6 @@ struct BookDetailView: View {
     private var heroHeight: CGFloat {
         let screen = UIScreen.main.bounds.height
         return min(max(screen * 0.52, 340), 470)
-    }
-
-    private func fallbackCover(width: CGFloat, height: CGFloat) -> some View {
-        ZStack {
-            LinearGradient(colors: [Color(white: 0.22), Color(white: 0.10)],
-                           startPoint: .topLeading, endPoint: .bottomTrailing)
-            Image(systemName: "book.closed.fill")
-                .font(.system(size: 56))
-                .foregroundStyle(.white.opacity(0.25))
-        }
-        .frame(width: width, height: height)
     }
 
     private var coverURL: URL? {
