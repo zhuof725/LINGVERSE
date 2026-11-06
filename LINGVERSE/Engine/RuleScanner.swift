@@ -142,8 +142,25 @@ enum RuleScanner {
     /// 剥掉规则里的 js 前缀，返回脚本正文。`@js:a` / `<js>a` / `@js:\na` 三种写法等价。
     static func scriptBody(_ rule: String) -> String? {
         let t = rule.trimmingCharacters(in: .whitespacesAndNewlines)
-        if t.hasPrefix("@js:") { return String(t.dropFirst(4)) }
-        if t.hasPrefix("<js>") { return String(t.dropFirst(4)) }
+        if t.hasPrefix("@js:") {
+            // @js: 可能也带 </js> 闭合（真实书源的 tocUrl 就这么写）
+            if let end = t.range(of: "</js>", options: .backwards) {
+                return String(t[t.index(t.startIndex, offsetBy: 4)..<end.lowerBound])
+            }
+            return String(t.dropFirst(4))
+        }
+        if t.hasPrefix("<js>") {
+            // 必须同时剥掉结尾的 </js>：只 dropFirst(4) 会把闭合标签
+            // 留在脚本里，JSContext 直接报语法错误，
+            // 而错误又被上层 catch 成"脚本返回空"。
+            if let end = t.range(of: "</js>", options: .backwards) {
+                let body = String(t[t.index(t.startIndex, offsetBy: 4)..<end.lowerBound])
+                let rest = String(t[end.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                // 后面还跟着 JSONPath 的（如 </js>$[*]）不算纯脚本
+                return rest.isEmpty ? body : nil
+            }
+            return String(t.dropFirst(4))
+        }
         return nil
     }
 }
