@@ -183,10 +183,6 @@ final class JSRunner {
         //   author:   String(result.author)   ← 要对象
         // 只满足一种，另一种就静默失败（脚本 catch 成 {} 返回空数组），
         // 界面上表现为「搜不到」，完全看不出原因。
-        if let result {
-            injectResult(result, into: context)
-        }
-
         // 让脚本能拿到当前响应（部分源写成 `result` 之外的名字）
         context.setObject(ctx.body, forKeyedSubscript: "__body" as NSString)
 
@@ -194,6 +190,16 @@ final class JSRunner {
         if let error = lastError {
             Diagnostics.shared.add("js", "prelude failed: \(error)")
             lastError = nil
+        }
+
+        // result 必须在 prelude 之后注入：injectResult 内部要用 __decodeB64，
+        // 那个宿主函数是在 prelude 之前才 setObject 的……
+        // 更重要的是这一行的位置：之前它排在 prelude 前面，
+        // __decodeB64 还不存在，注入结果成了空串，
+        // 于是 bookList 的 JSON.parse(result) 抛异常被书源 catch 成 {}，
+        // 表现为「搜不到」但零报错。
+        if let result {
+            injectResult(result, into: context)
         }
 
         // jsLib 必须在 prelude 之后、规则之前注入：
@@ -205,6 +211,12 @@ final class JSRunner {
                 lastError = error.toString() ?? "unknown"
                 Diagnostics.shared.add("js", "jsLib 执行失败: \(lastError ?? "")")
                 context.exception = nil
+            } else {
+                // 常量定义在 jsLib 末尾，中间任何一步抛异常都会导致它们没定义。
+                // 这里显式回报，一眼能看出 jsLib 到底跑完了没有。
+                let probe = context.evaluateScript(
+                    "[typeof FQ_BASE, typeof FQ_IID, typeof fanqieSignHeaders].join('|')")
+                Diagnostics.shared.add("js", "jsLib 就绪: \(probe?.toString() ?? "?")")
             }
         }
 
@@ -315,17 +327,29 @@ final class JSRunner {
       //   get(url, headers)  取网页，返回 StrResponse
       //   get(key)           读 java.put 存的变量，返回字符串
       get: function(a, b) {
-        var isURL = /^https?:/i.test(String(a));
+        var s = String(a === undefined || a === null ? '' : a);
+        var isURL = /^https?:/i.test(s);
         if (typeof b === 'undefined' && !isURL) {
-          return (__ruleVars[String(a)] !== undefined) ? __ruleVars[String(a)] : '';
+          // 变量读取：找不到就返回空串，不要当成请求发出去
+          return (__ruleVars[s] !== undefined) ? __ruleVars[s] : '';
+        }
+        if (!isURL) {
+          // URL 为空或不是 http 开头：这是调用方的 bug，记下来但要能看出是哪次调用
+          var where = '';
+          try { where = String((new Error()).stack || '').split('\n')[1] || ''; } catch (e) {}
+          __log('[get] 非法地址: ' + JSON.stringify(s.slice(0, 60)) + ' · ' + where.slice(0, 80));
+          return __wrapResponse('');
         }
         var opt = { method: 'GET' };
         if (b) {
-          opt.headers = (typeof b === 'string') ? JSON.parse(b) : b;
-          // HashMap 实例在 JS 侧已展开成普通对象
-          if (opt.headers && opt.headers.__map) opt.headers = opt.headers.__map;
+          try {
+            opt.headers = (typeof b === 'string') ? JSON.parse(b) : b;
+            if (opt.headers && opt.headers.__map) opt.headers = opt.headers.__map;
+          } catch (e) { opt.headers = {}; }
         }
-        return __wrapResponse(__request(String(a), JSON.stringify(opt)));
+        var body = __request(s, JSON.stringify(opt));
+        __log('[get] ' + s.slice(0, 70) + ' -> ' + String(body).length + ' 字符');
+        return __wrapResponse(body);
       },
       post: function(u, body, headers) {
         var opt = {method: 'POST', body: String(body === undefined ? '' : body)};

@@ -194,8 +194,12 @@ enum RuleEngine {
     static func jsonPathNodes(_ path: String, _ root: Any) -> [Any] {
         var p = path.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !p.isEmpty else { return [] }
-        if p.hasPrefix("$") { /* JsonPath.parse 接受 $ */ }
-        else { p = "$." + p }
+        // 已经是完整表达式（$.x / $..x / $[0]）就原样用。
+        // 之前这里对 "$.book_id" 做了 dropFirst() 再拼 "$."，变成 "$..book_id" ——
+        // 递归下降，语义完全变了：会扫全树，且返回数组而非单值。
+        if !p.hasPrefix("$") {
+            if p.hasPrefix(".") { p = "$" + p } else { p = "$." + p }
+        }
         return JsonPath.query(root, p)
     }
 
@@ -209,7 +213,7 @@ enum RuleEngine {
     /// 把任意 JSON 对象序列化回字符串，给脚本当 `result` 用。
     static func serializeJSON(_ value: Any) -> String {
         if let s = value as? String { return s }
-        if let n = value as? NSNumber { return n.stringValue }
+        if let n = value as? NSNumber { return scalarString(n) }
         guard JSONSerialization.isValidJSONObject(value),
               let data = try? JSONSerialization.data(withJSONObject: value),
               let s = String(data: data, encoding: .utf8) else { return "" }
@@ -248,7 +252,7 @@ enum RuleEngine {
         // `$...` 或 `$.` → JSONPath
         if expr.hasPrefix("$") {
             guard let obj = json ?? parseJSON(ctx.body) else { return "" }
-            let nodes = jsonPathNodes(expr.hasPrefix("$.") ? String(expr.dropFirst()) : expr, obj)
+            let nodes = jsonPathNodes(expr, obj)
             if nodes.count == 1, let s = nodes[0] as? String { return s }
             return nodes.map { scalarString($0) }.joined(separator: ",")
         }
@@ -273,8 +277,28 @@ enum RuleEngine {
 
     private static func scalarString(_ value: Any) -> String {
         if let s = value as? String { return s }
-        if let n = value as? NSNumber { return n.stringValue }
         if value is NSNull { return "" }
+        if let n = value as? NSNumber {
+            // 19 位数字（番茄的 book_id）超出 Double 的精确整数范围（2^53），
+            // NSNumber.stringValue 会输出 7.233717404444921e+18 这种科学计数法，
+            // 拼进 URL 就成了坏地址。这里按"是不是整数"分别处理。
+            let type = String(cString: n.objCType)
+            let isBool = type == "c" || type == "B"
+            if isBool { return n.boolValue ? "true" : "false" }
+            if type == "q" || type == "l" || type == "i" || type == "s" {
+                return String(n.int64Value)   // 从 JSON 整数解析来的，精度完好
+            }
+            let d = n.doubleValue
+            if d == d.rounded(), abs(d) < 1e18 {
+                // 能精确表示的整数：不要走 %f，避免 .0 尾巴
+                return String(format: "%.0f", d)
+            }
+            if d == d.rounded() {
+                // 大整数但已经是 double：只能尽力还原，至少不用科学计数法
+                return String(format: "%.0f", d)
+            }
+            return n.stringValue
+        }
         if let data = try? JSONSerialization.data(withJSONObject: value),
            let s = String(data: data, encoding: .utf8) { return s }
         return ""

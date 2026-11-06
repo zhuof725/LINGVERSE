@@ -101,6 +101,14 @@ final class SourcePipeline {
 
         let items = RuleEngine.evalList(rule.bookList, ctx, json: json)
         Diagnostics.shared.add("search", "bookList \(items.count) 条")
+        if items.isEmpty {
+            // 空列表是「搜不到」的唯一征兆，但没有异常。把原始响应长度和
+            // 前 200 字符记下来，才能判断是响应本身不对，还是规则没解析出来。
+            Diagnostics.shared.add("search", "响应 \(body.count) 字符，前 200：\(body.prefix(200))")
+            if let jsErr = JSRunner.shared.lastError {
+                Diagnostics.shared.add("search", "js 错误：\(jsErr)")
+            }
+        }
 
         return items.compactMap { item in
             let itemCtx = ctxWithItem(item, base: ctx)
@@ -130,6 +138,10 @@ final class SourcePipeline {
     /// 抓详情页，拿到书名/作者/封面/简介，以及目录地址（tocUrl）。
     func bookInfo(_ bookURL: String, source: BookSource, hint: SearchResult? = nil) throws -> BookDetail {
         let rule = source.ruleBookInfo
+        Diagnostics.shared.add("bookInfo", "bookUrl=\(bookURL.prefix(90))")
+        guard !bookURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw SourceError.badURL("bookUrl 为空（搜索结果的 bookUrl 规则没产出地址）")
+        }
         var ctx = RuleContext(baseURL: bookURL)
         ctx.book = ["name": hint?.name ?? "", "bookUrl": bookURL, "author": hint?.author ?? ""]
         ctx.jsLib = source.jsLib ?? ""
@@ -156,6 +168,10 @@ final class SourcePipeline {
                 initBody = produced
             }
             Diagnostics.shared.add("bookInfo", "init 产出 \(produced.count) 字符")
+            if produced == "{}" || produced.count <= 2 {
+                // 书源自己的 try/catch 会吞掉所有异常，这里必须把线索留下来
+                Diagnostics.shared.add("bookInfo", "init 失败 · seed \(seed.count) 字符 · js错误 \(JSRunner.shared.lastError ?? "无")")
+            }
         }
 
         let body: String

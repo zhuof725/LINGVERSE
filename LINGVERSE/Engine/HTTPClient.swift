@@ -61,8 +61,13 @@ final class HTTPClient {
                 return
             }
             status = (response as? HTTPURLResponse)?.statusCode ?? 0
-            guard let data else { return }
-            result = Self.decode(data, response: response)
+            guard let data else {
+                Diagnostics.shared.add("http", "\(method) \(target.host ?? "") 无响应体")
+                return
+            }
+            let text = Self.decode(data, response: response)
+            result = text
+            Diagnostics.shared.add("http", "\(method) \(target.host ?? "") → \(status) \(text.count) 字符")
         }
         task.resume()
 
