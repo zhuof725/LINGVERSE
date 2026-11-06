@@ -218,11 +218,11 @@ final class SourcePipeline {
                 detail.duration = d > 0 ? d : nil
             }
             if let tags = obj["tags"] as? String {
-                detail.tags = tags.split(whereSeparator: { $0 == "," || $0 == "，" || $0 == "|" })
+                let parts: [String] = tags
+                    .split(whereSeparator: { $0 == "," || $0 == "，" || $0 == "|" })
                     .map { $0.trimmingCharacters(in: .whitespaces) }
                     .filter { !$0.isEmpty }
-                    .prefix(6)
-                    .map(String.init)
+                detail.tags = Array(parts.prefix(6))
             }
             // 番茄：update_status 0 = 完结。别的源可能用 is_finished。
             if let s = obj["update_status"] as? NSNumber {
