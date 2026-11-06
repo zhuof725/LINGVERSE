@@ -109,7 +109,6 @@ struct BookDetailView: View {
             VStack(spacing: 0) {
                 heroHeader(pull: pullOffset)
                     // 探针挂在 hero 上，不占布局高度，也不会在顶部留缝。
-                    // hero 的拉伸用 scaleEffect，不改变父级 ScrollView 的层级关系。
                     .background(
                         ScrollOffsetReader { offset in
                             let pull = max(-offset, 0)
@@ -120,7 +119,6 @@ struct BookDetailView: View {
                         .frame(height: 0)
                     )
 
-                heroHeader(pull: pullOffset)
                 statsRow
                 tagAndIntro
                 tabBar
@@ -144,34 +142,39 @@ struct BookDetailView: View {
     /// `pull` 是下拉回弹的距离（ScrollView 内容顶部超出屏幕的高度）。
     /// 大于 0 时把图片高度加上这段，图片就跟着手指一起拉长，不会露出背景。
     private func heroHeader(pull: CGFloat) -> some View {
-        GeometryReader { geo in
+        // 下拉时图片会向上溢出这个容器（底边固定，顶边向上长）。
+        // 容器本身高度不变，所以不会推动下方内容；
+        // 溢出部分靠父级不裁剪来显示。
+        let extra = max(pull, 0)
+        return GeometryReader { geo in
             let h = geo.size.height
             ZStack(alignment: .bottomLeading) {
                 // 整幅封面。
-                // 下拉时不下改布局高度（那会把下方内容推下去、产生白块或滚动跳动），
-                // 而是让图片按「底边锚点」向上放大 —— 视觉上顶边贴住屏幕顶、
-                // 图片被拉长，布局高度纹丝不动。
+                //
+                // 关键：用 .resizable().scaledToFill() 而不是 .aspectRatio(contentMode: .fill)。
+                // 后者一旦外面套了固定宽高的 .frame，aspectRatio 就失效，
+                // 图片会被直接拉伸填满 —— 用户截图里封面上下分裂成两截、
+                // 人物被拉变形，就是这个原因。
+                // scaledToFill 会保持比例放大再裁切，配合 .clipped() 才是正确行为。
                 AsyncImage(url: coverURL) { phase in
                     switch phase {
                     case .success(let image):
                         image.resizable()
-                            .aspectRatio(contentMode: .fill)
-                            .frame(width: geo.size.width, height: h)
+                            .scaledToFill()
+                            .frame(width: geo.size.width, height: h + extra)
                             .clipped()
-                            .scaleEffect(
-                                x: 1,
-                                y: (h + max(pull, 0)) / max(h, 1),
-                                anchor: .bottom
-                            )
                     case .failure:
-                        fallbackCover(width: geo.size.width, height: h)
-                            .scaleEffect(x: 1, y: (h + max(pull, 0)) / max(h, 1), anchor: .bottom)
+                        fallbackCover(width: geo.size.width, height: h + extra)
                     default:
                         Rectangle()
                             .fill(Color(white: 0.14))
                             .overlay(ProgressView().tint(.white.opacity(0.6)))
                     }
                 }
+                // 图片高度 = 容器高度 + 下拉距离，alignment: .bottom 让底边钉住，
+                // 多出来的高度自然向上溢出（GeometryReader 不裁剪子视图）。
+                // 不要再加 offset —— 那会把底边也一起推上去，底部露缝。
+                .frame(height: h + extra, alignment: .bottom)
 
                 // 底部渐变：保证白字可读，顶部留一点暗角防止状态栏看不清
                 LinearGradient(
