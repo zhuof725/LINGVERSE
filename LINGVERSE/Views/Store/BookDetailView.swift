@@ -166,13 +166,18 @@ struct BookDetailView: View {
                 )
                 .allowsHitTesting(false)
 
-                VStack(alignment: .leading, spacing: 8) {
+                VStack(alignment: .center, spacing: 8) {
                     Text(detail?.name ?? result.name)
                         .font(.system(size: 26, weight: .bold))
                         .foregroundStyle(.white)
                         .lineLimit(2)
+                        .multilineTextAlignment(.center)
                         .fixedSize(horizontal: false, vertical: true)
-                        .shadow(color: .black.opacity(0.4), radius: 4, y: 1)
+                        // 去掉阴影：之前那圈 shadow 在封面中间压出一条暗带，
+                        // 看起来像两张图拼接的接缝。渐变层已经把底部压暗了，
+                        // 白字本身对比度够，不需要额外阴影。
+                        .frame(maxWidth: .infinity)
+                        .padding(.horizontal, 20)
 
                     HStack(spacing: 6) {
                         Image(systemName: "person.crop.circle.fill")
@@ -192,6 +197,7 @@ struct BookDetailView: View {
                     }
                     .foregroundStyle(.white.opacity(0.6))
                 }
+                .frame(maxWidth: .infinity)
                 .padding(.horizontal, 20)
                 .padding(.bottom, 22)
             }
