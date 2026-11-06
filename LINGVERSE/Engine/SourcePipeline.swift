@@ -64,6 +64,7 @@ final class SourcePipeline {
         var intro: String?
         var kind: String?
         var lastChapter: String?
+        var wordCount: String?
     }
 
     /// 用一条书源搜索关键字。`page` 从 1 开始。
@@ -128,7 +129,8 @@ final class SourcePipeline {
                 coverUrl: RuleEngine.eval(rule.coverUrl, itemCtx, json: item).string.nilIfEmpty,
                 intro: RuleEngine.eval(rule.intro, itemCtx, json: item).string.nilIfEmpty,
                 kind: RuleEngine.eval(rule.kind, itemCtx, json: item).string.nilIfEmpty,
-                lastChapter: RuleEngine.eval(rule.lastChapter, itemCtx, json: item).string.nilIfEmpty
+                lastChapter: RuleEngine.eval(rule.lastChapter, itemCtx, json: item).string.nilIfEmpty,
+                wordCount: RuleEngine.eval(rule.wordCount, itemCtx, json: item).string.nilIfEmpty
             )
         }
     }
@@ -205,6 +207,31 @@ final class SourcePipeline {
         )
         ctx.book = ["name": detail.name, "author": detail.author, "bookUrl": detail.bookUrl]
 
+        // 详情页要展示的统计信息。各书源字段名不同，按常见候选依次找。
+        // 取不到就留空，界面上那一格自动省略 —— 不要显示 0，那是在撒谎。
+        if let obj = json as? [String: Any] {
+            detail.chapterCount = Self.intValue(obj, keys: ["serial_count", "chapter_number",
+                                                            "chapter_count", "totalChapter"])
+            detail.playCount = Self.intValue(obj, keys: ["listen_count", "play_count",
+                                                          "read_count_all", "listen_dcnt"])
+            if let d = Self.doubleValue(obj, keys: ["duration", "total_duration"]) {
+                detail.duration = d > 0 ? d : nil
+            }
+            if let tags = obj["tags"] as? String {
+                detail.tags = tags.split(whereSeparator: { $0 == "," || $0 == "，" || $0 == "|" })
+                    .map { $0.trimmingCharacters(in: .whitespaces) }
+                    .filter { !$0.isEmpty }
+                    .prefix(6)
+                    .map(String.init)
+            }
+            // 番茄：update_status 0 = 完结。别的源可能用 is_finished。
+            if let s = obj["update_status"] as? NSNumber {
+                detail.isFinished = s.intValue == 0
+            } else if let f = obj["is_finished"] as? Bool {
+                detail.isFinished = f
+            }
+        }
+
         // 目录地址：优先 tocUrl 规则，否则就当 bookUrl 本身是目录页。
         // tocUrl 规则往往产出「URL + 签名头」的 POST 请求，光存 URL 会丢掉 headers，
         // 所以返回的 detail 里把整个 spec 带上，toc() 直接用。
@@ -264,11 +291,14 @@ final class SourcePipeline {
             let rawURL = RuleEngine.eval(rule.chapterUrl, urlCtx, json: item).string
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             guard let url = absolute(rawURL, base: tocURL) else { continue }
+            let updateTime = RuleEngine.eval(rule.updateTime, itemCtx, json: item).string
+                .trimmingCharacters(in: .whitespacesAndNewlines)
             chapters.append(SourceChapter(
                 index: index,
                 title: title.isEmpty ? "第 \(index + 1) 章" : title,
                 url: url,
-                isVip: RuleEngine.eval(rule.isVip, itemCtx, json: item).string.contains("true")
+                isVip: RuleEngine.eval(rule.isVip, itemCtx, json: item).string.contains("true"),
+                updateTime: updateTime.isEmpty ? nil : updateTime
             ))
         }
         return chapters
@@ -324,6 +354,23 @@ final class SourcePipeline {
 
     // MARK: - 辅助
 
+    /// 从 JSON 里按候选字段名取整数。字符串形式的数字也接受。
+    private static func intValue(_ obj: [String: Any], keys: [String]) -> Int? {
+        for key in keys {
+            if let n = obj[key] as? NSNumber { return n.intValue }
+            if let s = obj[key] as? String, let v = Int(s) { return v }
+        }
+        return nil
+    }
+
+    private static func doubleValue(_ obj: [String: Any], keys: [String]) -> Double? {
+        for key in keys {
+            if let n = obj[key] as? NSNumber { return n.doubleValue }
+            if let s = obj[key] as? String, let v = Double(s) { return v }
+        }
+        return nil
+    }
+
     private func baseURL(of source: BookSource) -> String {
         // bookSourceUrl 可能带 `##` 注释后缀，取前半
         let raw = source.bookSourceUrl
@@ -363,6 +410,18 @@ struct BookDetail {
     /// 目录请求的完整参数。tocUrl 规则常产出带签名头的 POST，
     /// 只存 URL 会让 toc() 重新发明一次请求，签名就失效了。
     var tocRequest: RequestSpec?
+
+    // MARK: 详情页展示用（来自各书源的扩展字段，没有就省略）
+    /// 章节总数（番茄的 serial_count / chapter_number）
+    var chapterCount: Int?
+    /// 全书时长（秒）
+    var duration: TimeInterval?
+    /// 播放量
+    var playCount: Int?
+    /// 标签，逗号分隔
+    var tags: [String] = []
+    /// 连载状态：true = 已完结
+    var isFinished: Bool = false
 }
 
 struct SourceChapter: Identifiable, Hashable {
@@ -371,6 +430,9 @@ struct SourceChapter: Identifiable, Hashable {
     var title: String
     var url: String
     var isVip: Bool = false
+    /// 书源 ruleToc.updateTime 的原文。番茄源在这里塞了「2043 字 · ≈7:15」，
+    /// 直接展示比解析成时间更有用。
+    var updateTime: String?
 }
 
 // MARK: - 错误
