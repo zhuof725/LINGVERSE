@@ -29,6 +29,12 @@ jobs:
       - name: Install XcodeGen
         run: brew install xcodegen
 
+      - name: Check embedded JS syntax
+        run: |
+          # Swift 多行字符串会解释 \n 等转义，JS 里的转义会被改写成真换行，
+          # 编译期不报错、运行时才炸成 Unexpected EOF。这里提前拦住。
+          python3 Tools/check_prelude.py
+
       - name: Generate project
         run: xcodegen generate
 

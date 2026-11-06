@@ -334,9 +334,12 @@ final class JSRunner {
           return (__ruleVars[s] !== undefined) ? __ruleVars[s] : '';
         }
         if (!isURL) {
-          // URL 为空或不是 http 开头：这是调用方的 bug，记下来但要能看出是哪次调用
+          // URL 为空或不是 http 开头：这是调用方的 bug，记下来但要能看出是哪次调用。
+          // 注意：Swift 多行字符串会解释反斜杠转义，连注释里都不能写，
+          // 用 String.fromCharCode(10) 取换行更安全。
+          var LF = String.fromCharCode(10);
           var where = '';
-          try { where = String((new Error()).stack || '').split('\n')[1] || ''; } catch (e) {}
+          try { where = String((new Error()).stack || '').split(LF)[1] || ''; } catch (e) {}
           __log('[get] 非法地址: ' + JSON.stringify(s.slice(0, 60)) + ' · ' + where.slice(0, 80));
           return __wrapResponse('');
         }
