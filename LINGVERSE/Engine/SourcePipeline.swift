@@ -298,7 +298,8 @@ final class SourcePipeline {
                 title: title.isEmpty ? "第 \(index + 1) 章" : title,
                 url: url,
                 isVip: RuleEngine.eval(rule.isVip, itemCtx, json: item).string.contains("true"),
-                updateTime: updateTime.isEmpty ? nil : updateTime
+                updateTime: updateTime.isEmpty ? nil : updateTime,
+                publishDate: Self.dateFromItem(item)
             ))
         }
         return chapters
@@ -371,6 +372,27 @@ final class SourcePipeline {
         return nil
     }
 
+    /// 从章节条目里取发布日期。
+    ///
+    /// 各书源字段名不同，番茄给的是 `first_pass_time`（Unix 秒）。
+    /// 只做「时间戳 → MM-dd」这一种转换，其它形态不认识就返回 nil ——
+    /// 宁可少显示一项，也不要显示错误日期。
+    private static func dateFromItem(_ item: [String: Any]) -> String? {
+        let keys = ["first_pass_time", "create_time", "publish_time", "update_time", "ut"]
+        for key in keys {
+            guard let raw = item[key] else { continue }
+            var seconds: Double?
+            if let n = raw as? NSNumber { seconds = n.doubleValue }
+            else if let s = raw as? String, let d = Double(s) { seconds = d }
+            guard let ts = seconds, ts > 1_000_000_000 else { continue }
+            let date = Date(timeIntervalSince1970: ts)
+            let f = DateFormatter()
+            f.dateFormat = "MM-dd"
+            return f.string(from: date)
+        }
+        return nil
+    }
+
     private func baseURL(of source: BookSource) -> String {
         // bookSourceUrl 可能带 `##` 注释后缀，取前半
         let raw = source.bookSourceUrl
@@ -433,6 +455,9 @@ struct SourceChapter: Identifiable, Hashable {
     /// 书源 ruleToc.updateTime 的原文。番茄源在这里塞了「2043 字 · ≈7:15」，
     /// 直接展示比解析成时间更有用。
     var updateTime: String?
+    /// 发布日期（部分书源单独给）。番茄源把日期和字数都塞在 updateTime 里，
+    /// toc 解析时会顺手拆出来。
+    var publishDate: String?
 }
 
 // MARK: - 错误

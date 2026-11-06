@@ -25,6 +25,7 @@ struct BookDetailView: View {
     @State private var query = ""
     @State private var isSearching = false
     @State private var playError: String?
+    @State private var isPlayerPresented = false
 
     enum DetailTab: String, CaseIterable {
         case chapters = "节目列表"
@@ -60,6 +61,9 @@ struct BookDetailView: View {
         .toolbarColorScheme(.dark, for: .navigationBar)
         .toolbar(.hidden, for: .tabBar)
         .task { load() }
+        .sheet(isPresented: $isPlayerPresented) {
+            PlayerView()
+        }
         .alert("播放失败", isPresented: Binding(
             get: { playError != nil },
             set: { if !$0 { playError = nil } }
@@ -92,6 +96,11 @@ struct BookDetailView: View {
     }
 
     // MARK: - 主内容
+
+    /// 上半部分（图片 + 数据行 + 标签 + 简介）整体压在深色底上，
+    /// 和目标图一致：从封面往下颜色连续，到 Tab 栏才切成浅色。
+    private static let heroBackground = Color(red: 0.11, green: 0.10, blue: 0.10)
+    private static let heroDivider = Color.white.opacity(0.14)
 
     private var contentView: some View {
         ScrollView {
@@ -240,9 +249,9 @@ struct BookDetailView: View {
                 if offset < statItems.count - 1 { divider }
             }
         }
-        .padding(.vertical, 16)
+        .padding(.vertical, 18)
         .padding(.horizontal, 8)
-        .background(Color(.secondarySystemGroupedBackground))
+        .background(Self.heroBackground)
     }
 
     private var statusText: String? {
@@ -252,20 +261,20 @@ struct BookDetailView: View {
 
     private var divider: some View {
         Rectangle()
-            .fill(Color.secondary.opacity(0.18))
-            .frame(width: 1, height: 26)
+            .fill(Self.heroDivider)
+            .frame(width: 0.5, height: 30)
     }
 
     private func statCell(value: String, label: String, highlight: Bool = false) -> some View {
-        VStack(spacing: 4) {
+        VStack(spacing: 5) {
             Text(value)
                 .font(.system(size: 22, weight: .semibold, design: .rounded))
-                .foregroundStyle(highlight ? Color.accentColor : .primary)
+                .foregroundStyle(highlight ? Color(red: 0.35, green: 0.62, blue: 1.0) : .white)
                 .lineLimit(1)
                 .minimumScaleFactor(0.6)
             Text(label)
                 .font(.caption2)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.white.opacity(0.55))
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, 2)
@@ -281,50 +290,68 @@ struct BookDetailView: View {
 
         return Group {
             if hasTags || hasIntro {
-                VStack(alignment: .leading, spacing: 12) {
+                VStack(alignment: .leading, spacing: 14) {
                     if hasTags {
-                        // 两行流式布局：超出换行，不横向滚动（滚动容易被误当成可点）
+                        // 流式换行。第一个标签高亮（书源常把最重要的分类放首位）
                         FlowLayout(spacing: 8) {
-                            ForEach(tags, id: \.self) { tag in
+                            ForEach(Array(tags.enumerated()), id: \.offset) { index, tag in
                                 Text(tag)
-                                    .font(.caption)
-                                    .padding(.horizontal, 10)
-                                    .padding(.vertical, 5)
-                                    .background(Color.secondary.opacity(0.10), in: Capsule())
-                                    .foregroundStyle(.secondary)
+                                    .font(.system(size: 12))
+                                    .padding(.horizontal, 11)
+                                    .padding(.vertical, 6)
+                                    .background(
+                                        index == 0
+                                        ? Color(red: 0.24, green: 0.42, blue: 0.78).opacity(0.55)
+                                        : Color.white.opacity(0.10),
+                                        in: Capsule()
+                                    )
+                                    .foregroundStyle(index == 0 ? .white : .white.opacity(0.72))
                             }
                         }
                     }
 
                     if hasIntro {
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text(intro)
-                                .font(.footnote)
-                                .foregroundStyle(.secondary)
-                                .lineSpacing(3)
-                                .lineLimit(isIntroExpanded ? nil : 3)
-                                .fixedSize(horizontal: false, vertical: true)
+                        // 简介整块放进深色圆角卡片，「简介：」作为内联前缀
+                        VStack(alignment: .leading, spacing: 8) {
+                            Group {
+                                Text("简介：").fontWeight(.medium)
+                                    .foregroundStyle(.white.opacity(0.9))
+                                + Text(intro)
+                                    .foregroundStyle(.white.opacity(0.62))
+                            }
+                            .font(.system(size: 13.5))
+                            .lineSpacing(4)
+                            .lineLimit(isIntroExpanded ? nil : 3)
+                            .fixedSize(horizontal: false, vertical: true)
 
                             Button {
                                 withAnimation(.easeInOut(duration: 0.2)) {
                                     isIntroExpanded.toggle()
                                 }
                             } label: {
-                                HStack(spacing: 2) {
+                                HStack(spacing: 3) {
                                     Text(isIntroExpanded ? "收起" : "更多")
                                     Image(systemName: isIntroExpanded ? "chevron.up" : "chevron.down")
-                                        .font(.system(size: 9))
+                                        .font(.system(size: 9, weight: .semibold))
                                 }
-                                .font(.caption2)
-                                .foregroundStyle(Color.accentColor)
+                                .font(.system(size: 12))
+                                .foregroundStyle(.white.opacity(0.75))
                             }
+                            .buttonStyle(.plain)
                         }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(14)
+                        .background(Color.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 14))
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal, 18)
-                .padding(.vertical, 16)
-                .background(Color(.secondarySystemGroupedBackground))
+                .padding(.top, 4)
+                .padding(.bottom, 18)
+                .background(Self.heroBackground)
+            } else {
+                // 没有标签也没有简介时，仍要有一段深色收尾，避免图片直接贴到白底
+                Self.heroBackground.frame(height: 18)
             }
         }
     }
@@ -338,14 +365,14 @@ struct BookDetailView: View {
                     Button {
                         withAnimation(.easeInOut(duration: 0.18)) { tab = item }
                     } label: {
-                        VStack(spacing: 6) {
+                        VStack(spacing: 7) {
                             Text(tabLabel(item))
-                                .font(.subheadline.weight(tab == item ? .semibold : .regular))
+                                .font(.system(size: 16, weight: tab == item ? .bold : .regular))
                                 .foregroundStyle(tab == item ? .primary : .secondary)
-                            Rectangle()
-                                .fill(tab == item ? Color.accentColor : .clear)
-                                .frame(width: 22, height: 2.5)
-                                .clipShape(Capsule())
+                            // 选中项下面一小段横线，未选中留空占位，避免切换时行高跳动
+                            Capsule()
+                                .fill(tab == item ? Color.primary : Color.clear)
+                                .frame(width: 26, height: 3)
                         }
                         .frame(maxWidth: .infinity)
                         .contentShape(Rectangle())
@@ -353,10 +380,11 @@ struct BookDetailView: View {
                     .buttonStyle(.plain)
                 }
             }
-            .padding(.top, 14)
+            .padding(.top, 16)
+            .padding(.bottom, 10)
             Divider()
         }
-        .background(Color(.secondarySystemGroupedBackground))
+        .background(Color(.systemBackground))
     }
 
     private func tabLabel(_ item: DetailTab) -> String {
@@ -470,51 +498,64 @@ struct BookDetailView: View {
         return Button {
             play(chapter)
         } label: {
-            HStack(alignment: .top, spacing: 12) {
+            HStack(alignment: .top, spacing: 10) {
+                // 序号单独一列，字号略大，和标题有明显层级差
                 Text("\(displayIndex)")
-                    .font(.system(size: 13, design: .rounded))
-                    .foregroundStyle(isCurrent ? Color.accentColor : .secondary)
-                    .frame(width: 24, alignment: .trailing)
+                    .font(.system(size: 15, weight: .medium, design: .rounded))
+                    .foregroundStyle(isCurrent ? Color.accentColor : .primary.opacity(0.55))
+                    .frame(width: 26, alignment: .trailing)
                     .padding(.top, 1)
 
-                VStack(alignment: .leading, spacing: 5) {
+                VStack(alignment: .leading, spacing: 6) {
                     Text(chapter.title)
-                        .font(.subheadline)
+                        .font(.system(size: 15))
                         .foregroundStyle(isCurrent ? Color.accentColor : .primary)
                         .lineLimit(2)
                         .multilineTextAlignment(.leading)
                         .fixedSize(horizontal: false, vertical: true)
 
-                    HStack(spacing: 10) {
-                        // updateTime 里已经含「2043 字 · ≈7:15」，只渲染一次
+                    // 第二行：时长 + 日期 + 播放量。书源能给什么就显示什么
+                    HStack(spacing: 8) {
                         if let ut = chapter.updateTime, !ut.isEmpty {
-                            Label(ut, systemImage: "clock")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
+                            HStack(spacing: 3) {
+                                Image(systemName: "clock")
+                                    .font(.system(size: 9))
+                                Text(ut)
+                            }
+                        }
+                        if let date = chapter.publishDate, !date.isEmpty {
+                            Text(date)
+                        }
+                        if isCurrent {
+                            HStack(spacing: 3) {
+                                Image(systemName: player.isPlaying ? "waveform" : "pause.fill")
+                                    .font(.system(size: 8))
+                                Text(player.isPlaying ? "播放中" : "已暂停")
+                            }
+                            .foregroundStyle(Color.accentColor)
                         }
                     }
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(.secondary)
                 }
 
                 Spacer(minLength: 4)
 
                 Group {
                     if loadingChapterIndex == chapter.index {
-                        ProgressView().scaleEffect(0.7)
-                    } else if isCurrent {
-                        Image(systemName: player.isPlaying ? "waveform" : "pause.circle")
-                            .foregroundStyle(Color.accentColor)
-                            .font(.subheadline)
+                        ProgressView().scaleEffect(0.65)
                     } else {
-                        Image(systemName: "play.circle")
+                        Image(systemName: "ellipsis")
+                            .font(.system(size: 14))
                             .foregroundStyle(.tertiary)
-                            .font(.subheadline)
+                            .rotationEffect(.degrees(90))
                     }
                 }
-                .frame(width: 24)
-                .padding(.top, 1)
+                .frame(width: 22)
+                .padding(.top, 2)
             }
             .padding(.horizontal, 18)
-            .padding(.vertical, 12)
+            .padding(.vertical, 14)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -621,45 +662,55 @@ struct BookDetailView: View {
     // MARK: - 底部操作栏
 
     private var bottomBar: some View {
-        HStack(spacing: 12) {
-            Button {
-                toggleShelf()
-            } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: onShelf ? "checkmark" : "plus")
-                        .font(.footnote.weight(.semibold))
-                    Text(onShelf ? "已在书架" : "订阅收藏")
-                        .font(.subheadline.weight(.medium))
-                }
-                .frame(maxWidth: .infinity)
-                .frame(height: 46)
-                .background(Color(.tertiarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 10))
-                .foregroundStyle(onShelf ? Color.accentColor : .primary)
+        VStack(spacing: 0) {
+            // 正在播别的书时，底部栏上方浮一条迷你播放条（和目标图一致）
+            if player.currentBook?.bookUrl != detail?.bookUrl, player.currentBook != nil {
+                MiniPlayerBar { isPlayerPresented = true }
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, 6)
             }
-            .buttonStyle(.plain)
 
-            Button {
-                continuePlay()
-            } label: {
-                HStack(spacing: 8) {
-                    Image(systemName: player.isPlaying ? "pause.fill" : "play.fill")
-                        .font(.footnote)
-                    Text(playButtonTitle)
-                        .font(.subheadline.weight(.semibold))
-                        .lineLimit(1)
+            HStack(spacing: 12) {
+                Button {
+                    toggleShelf()
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: onShelf ? "checkmark" : "heart")
+                            .font(.system(size: 15, weight: .medium))
+                        Text(onShelf ? "已在书架" : "订阅收藏")
+                            .font(.system(size: 15, weight: .medium))
+                    }
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 48)
+                    .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12))
+                    .foregroundStyle(onShelf ? Color.accentColor : .primary)
                 }
-                .frame(maxWidth: .infinity)
-                .frame(height: 46)
-                .background(Color.accentColor, in: RoundedRectangle(cornerRadius: 10))
-                .foregroundStyle(.white)
+                .buttonStyle(.plain)
+
+                Button {
+                    continuePlay()
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: player.isPlaying ? "pause.fill" : "play.fill")
+                            .font(.system(size: 13))
+                        Text(playButtonTitle)
+                            .font(.system(size: 15, weight: .semibold))
+                            .lineLimit(1)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 48)
+                    .background(Color(red: 0.90, green: 0.24, blue: 0.24),
+                                in: RoundedRectangle(cornerRadius: 12))
+                    .foregroundStyle(.white)
+                }
+                .buttonStyle(.plain)
+                .disabled(chapters.isEmpty)
+                .opacity(chapters.isEmpty ? 0.45 : 1)
             }
-            .buttonStyle(.plain)
-            .disabled(chapters.isEmpty)
-            .opacity(chapters.isEmpty ? 0.5 : 1)
+            .padding(.horizontal, 16)
+            .padding(.top, 8)
+            .padding(.bottom, 6)
         }
-        .padding(.horizontal, 16)
-        .padding(.top, 10)
-        .padding(.bottom, 8)
         .background(.regularMaterial)
         .overlay(alignment: .top) { Divider() }
     }
