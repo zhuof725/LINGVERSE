@@ -26,6 +26,10 @@ struct BookDetailView: View {
     @State private var isSearching = false
     @State private var playError: String?
     @State private var isPlayerPresented = false
+    /// 下拉回弹时多拉出来的距离，用来把封面同步拉长
+    @State private var pullOffset: CGFloat = 0
+    /// 首帧读到的坐标基准，用于不同机型的安全区校准
+    @State private var baselineOffset: CGFloat?
 
     enum DetailTab: String, CaseIterable {
         case chapters = "节目列表"
@@ -105,11 +109,36 @@ struct BookDetailView: View {
     private var contentView: some View {
         ScrollView {
             VStack(spacing: 0) {
-                heroHeader
+                // 标尺：1pt 高的透明锚点（0 高时 GeometryReader 不参与布局，
+                // PreferenceKey 收不到更新）。它只用来读出「内容被拉下多少」。
+                Color.clear
+                    .frame(height: 1)
+                    .background(
+                        GeometryReader { proxy in
+                            Color.clear.preference(
+                                key: PullOffsetKey.self,
+                                value: proxy.frame(in: .named("detailScroll")).minY
+                            )
+                        }
+                    )
+
+                heroHeader(pull: pullOffset)
                 statsRow
                 tagAndIntro
                 tabBar
                 tabContent
+            }
+        }
+        .coordinateSpace(name: "detailScroll")
+        .onPreferenceChange(PullOffsetKey.self) { value in
+            // 用首帧的值做基准（正常情况下应该是 0，但不同机型/安全区下可能不是），
+            // 之后只关心「比基准多出来多少」。这样在哪种设备上都不会多算或少算。
+            if baselineOffset == nil {
+                baselineOffset = value
+            }
+            let pull = max(value - (baselineOffset ?? 0), 0)
+            if abs(pull - pullOffset) > 0.5 {
+                pullOffset = pull
             }
         }
         .ignoresSafeArea(edges: .top)
@@ -123,9 +152,12 @@ struct BookDetailView: View {
     ///
     /// 参考布局：一张封面**整幅**铺满（不模糊、不裁成小方块），
     /// 底部压一层深色渐变，标题/作者/书源直接叠在图上。
-    /// 高度取屏高的 52%，让它压得住整页 —— 太矮就变成「一张图 + 一堆文字」的普通列表。
-    private var heroHeader: some View {
-        GeometryReader { geo in
+    ///
+    /// `pull` 是下拉回弹的距离（ScrollView 内容顶部超出屏幕的高度）。
+    /// 大于 0 时把图片高度加上这段，图片就跟着手指一起拉长，不会露出背景。
+    private func heroHeader(pull: CGFloat) -> some View {
+        let totalHeight = heroHeight + max(pull, 0)
+        return GeometryReader { geo in
             let h = geo.size.height
             ZStack(alignment: .bottomLeading) {
                 // 整幅封面
@@ -155,8 +187,9 @@ struct BookDetailView: View {
                     ],
                     startPoint: .top, endPoint: .bottom
                 )
+                .allowsHitTesting(false)
 
-                // 标题 / 作者 / 书源
+                // 标题 / 作者 / 书源。始终贴在图片底部，拉长时跟着下移
                 VStack(alignment: .leading, spacing: 8) {
                     Text(detail?.name ?? result.name)
                         .font(.system(size: 26, weight: .bold))
@@ -187,7 +220,11 @@ struct BookDetailView: View {
                 .padding(.bottom, 22)
             }
         }
-        .frame(height: heroHeight)
+        .frame(height: totalHeight)
+        // 高度加了 pull 之后内容会往下长，再整体上移 pull：
+        // 结果是顶边保持在屏幕顶，底边向下延伸 —— 这就是下拉拉伸。
+        // 标尺在 hero 之外，不受这个 offset 影响，不会形成反馈循环。
+        .offset(y: pull > 0 ? -pull : 0)
         .frame(maxWidth: .infinity)
     }
 
@@ -812,6 +849,16 @@ struct BookDetailView: View {
         } else if let detail, let source {
             library.add(LBook(detail: detail, sourceId: source.id, sourceName: source.bookSourceName))
         }
+    }
+}
+
+// MARK: - 下拉偏移
+
+/// 读出 ScrollView 内容顶部在屏幕上的位置，用来判断「下拉了多少」。
+struct PullOffsetKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
     }
 }
 
