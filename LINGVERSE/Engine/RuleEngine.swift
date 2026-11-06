@@ -108,11 +108,32 @@ enum RuleEngine {
             return .text(out)
         }
 
-        // 3) 模板：把 {{expr}} 先替换成求值结果，剩余规则当普通选择器
+        // 3) 模板展开：把 {{expr}} 换成求值结果
         text = expandTemplate(text, ctx: ctx, json: json)
 
-        // 4) 管道：`##` 正则替换 / `&&` 交集
+        // 4) 字面量地址：展开后是完整 URL，直接返回。
+        //    真实书源的 bookUrl 大量写成 `https://x/robots.txt?bookId={{$.book_id}}`，
+        //    如果继续走 evalSelector 会被当 JSONPath，解析失败返回空串 ——
+        //    表现就是「bookUrl 为空（搜索结果的 bookUrl 规则没产出地址）」。
+        //    注意必须放在 expandTemplate 之后：否则含 {{}} 的 URL 会原样返回。
+        if isLiteralURL(text) { return .text(text) }
+
+        // 5) 管道：`##` 正则替换 / `&&` 交集
         return evalPipeline(text, ctx: ctx, json: json)
+    }
+
+    /// 规则展开后是不是一段字面地址 / 纯文本，而不是选择器表达式。
+    static func isLiteralURL(_ text: String) -> Bool {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty else { return false }
+        let lower = t.lowercased()
+        if lower.hasPrefix("http://") || lower.hasPrefix("https://") { return true }
+        // 含 URL 特征字符，且不像 JSONPath（没有 $. 开头）
+        if !t.hasPrefix("$"), !t.hasPrefix("@"), !t.hasPrefix("<"),
+           t.contains("://") || (t.contains("?") && t.contains("=")) {
+            return true
+        }
+        return false
     }
 
     /// 拆出 `<js>脚本</js>` 后面跟的 JSONPath。
